@@ -2,16 +2,23 @@
 
 ##### [课程表](https://pdos.csail.mit.edu/6.828/2018/schedule.html)
 
-##### [实验环境配置(其他报错问题可看评论区)](https://blog.csdn.net/Rcary/article/details/125547980?utm_source=app&app_version=4.17.0)
+##### [调试指令列表](https://pdos.csail.mit.edu/6.828/2018/labguide.html)
 
 ##### [Github参考](https://github.com/setowenGit/MIT6.828_OS)
 
+##### [Gitee参考](https://gitee.com/rcary/mit6.828/tree/master)
+
+##### [Github参考2](https://github.com/clpsz/mit-jos-2014/tree/master)
+
 ##### [知乎参考](https://zhuanlan.zhihu.com/p/166413604)
+
+##### [实验环境配置(其他报错问题可看评论区)](https://blog.csdn.net/Rcary/article/details/125547980?utm_source=app&app_version=4.17.0)
+
 ---
 
 ## Lab 1
 
-### PC Bootstrap
+### Part1. PC Bootstrap
 
  * QEMU模拟器：一个现代和相对快速的模拟器。虽然QEMU的内置监视器只提供有限的调试支持，但QEMU可以作为GNU调试器的远程调试目标，我们将在这个实验室中使用它来完成早期引导过程。
  * ```make qemu``` 和 ```make qemu-nox```：开启带有和不带有独立显示窗口的QEMU模拟器
@@ -31,13 +38,13 @@
 
 ![](fig/2023-11-18-17-15-35.png)
 
-### The Boot Loader
+### Part2. The Boot Loader
 
 * 当BIOS找到一个可引导的软盘或硬盘时，它将512字节的引导扇区加载到物理地址0x7c00到0x7dff的内存中，然后使用jmp指令将CS： IP设置为0000：7c00，并将控制传递给引导加载程序。
 * 由于扇区最大为512B，boot loader必须满足于512字节。
 * boot loader由一个汇编语言源文件 boot/boot.S 和一个C源文件 boot/main.c 组成
 * boot loader必须执行两个主要功能：
-  *  将处理器从real模式切换到32位保护模式，因为只有在保护模式下，软件才能访问处理器的物理地址空间中超过1MB的所有内存。在受保护的模式下，将[CS:IP]转换为物理地址的偏移量是32位，而不是16位（也就是段地址在十六进制下左移两位）
+  *  将处理器从real模式切换到32位保护模式，因为只有在保护模式下，软件才能访问处理器的物理地址空间中超过1MB的所有内存。在受保护的模式下，[CS:IP]不是像real模式一样直接指定了执行的物理地址，而是提供了一个段选择器和一个偏移量，通过段选择器和偏移量的组合来定位线性地址。
   *  通过x86的特殊I/O指令直接访问IDE磁盘设备寄存器，从而从硬盘中读取内核（也就是读取操作系统）
 * obj/boot/boot.asm 是 boot.S 的反汇编，很有用，可以看到每个指令的确切物理位置 
 
@@ -146,11 +153,13 @@ gdtdesc:
 
 #### main.c
 
-主要功能——将内核从硬盘读取进内存，可以把ELF可执行文件简单地看为带有加载信息的标头，后跟几个程序部分，每个程序部分都是一个连续的代码块或数据，其将被加载到指定内存中
+主要功能——将内核从硬盘读取进内存，然后进入内核入口。
+
+可以把ELF可执行文件看作是一个包含加载信息的头，然后是几个程序部分，每个部分都是一个连续的代码或数据块，包含了在指定的地址加载到内存的信息
 
 内核，也就是操作系统，存储在地址从0x10000开始的内存中
 
-#### exercise 6 问题
+##### exercise 6
 CPU从什么时候开始执行32-bit的代码？
 * ```ljmp    $PROT_MODE_CSEG, $protcseg```及其之后
 
@@ -159,9 +168,9 @@ CPU从什么时候开始执行32-bit的代码？
 
 内核引导器最后执行和内核最先执行的指令是什么？干了什么事情？
 * 内核引导器最后一个指令是```((void (*)(void)) (ELFHDR->e_entry))();```，由反汇编代码可看出程序跳转到地址*0x10018（注意是跳转到0x10018里面所存储的地址，而不是0x10018）
-* 最后debug可以看到ELFHDR->e_entry的值为1048588。转化为十六进制，就是0x10000c，这个就是内核的入口
-* 查看反汇编代码obj/kern/kernel.asm，可以看到，内核第一个指令的地址是0xf010000c，而C代码中函数跳转是到0x10000c
-* 这个区别虚拟地址和物理地址的不同导致的。虚拟地址为ELF文件在产生时，连接器给函数绑定的地址。处理器会进行地址映射，将虚拟地址映射到真实物理地址
+* 地址0x10018存储的信息是0x10000c，这个就是内核的入口，也就是内存中0x10000c存放着内核的第一个指令
+* 查看反汇编代码obj/kern/kernel.asm，可以看到，内核第一个指令的地址是0x**f0**10000c，而C代码中函数跳转是到0x10000c
+* 这个区别是由于虚拟内存机制中，虚拟地址和物理地址的不同导致的。虚拟地址为ELF文件在产生时，连接器给函数绑定的地址。处理器会进行地址映射，将虚拟地址映射到真实物理地址
 * 内核最先执行的指令是```readseg((uint32_t) ELFHDR, SECTSIZE*8, 0);```，读取进来的是一个镜像，也就是ELF文件的部分内容。读取进来的信息包含了文件头，真正的读取还要根据文件头中包含的信息执行，之后main里面做的就是将内核一块一块一次读进内存中，即
 ```c++
 for (; ph < eph; ph++)
@@ -169,8 +178,164 @@ for (; ph < eph; ph++)
 ```
 
 内核的第一个指令的地址是什么？
-* 0xf010000c
+* 虚拟地址为0xf010000c，真实物理地址是0x10000c
 
 内核引导器如何知道应该将多大的磁盘空间拷贝进内存？这个信息存放在哪里？
 * 加载内核的过程就是一种加载elf文件的过程
 * 解析elf文件可以得到内核每一块的size大小，也就知道要拷贝的内核有多大
+
+### Part3. The Kernel
+
+#### 虚拟内存机制
+
+加载内核时，将内核加载到内存中0x100000位置上，这是“物理内存地址” （Physical Address），而之前解析elf文件时显示的地址在0xf0100000，这是“虚拟地址” （Virtual Address）
+
+* 内核经常被放在较大的地址上，留出较小的地址给其他应用。不是所有的机器都有内核编译时候指定的0xf0100000这么多的内存空间，故要建立“虚拟地址”和“真实地址”之间的映射，从而让内核在物理内存中的真实位置按需改变，而在虚拟内存中的位置保持不变
+* 只要映射得当，就可以正常运行，程序员不需要关心运行的真实物理内存地址，从而简化了开发。不单单是内核，其他程序也可以使用这种机制
+
+kern/entry.S中修改了cr0和cr3寄存器
+* PG位：CR0的位31是分页（Paging）标志。当设置该位时即开启了分页机制；当复位时则禁止分页机制，此时所有线性地址等同于物理地址。在开启这个标志之前必须已经或者同时开启PE标志，也就是先切换到保护模式（PE已在boot.S置位）
+* CR3是页目录基址寄存器，保存页目录表的物理地址
+```asm
+# Load the physical address of entry_pgdir into cr3.  entry_pgdir is defined in entrypgdir.c.
+  movl	$(RELOC(entry_pgdir)), %eax
+  movl	%eax, %cr3
+
+# Turn on paging.
+	movl	%cr0, %eax
+	orl	$(CR0_PE|CR0_PG|CR0_WP), %eax
+	movl	%eax, %cr0
+```
+
+使用kern/entrypgdir.c中的静态初始化的页面目录和页表来完成虚拟内存映射，建立映射规则，将物理内存0x0-0xfffffff和虚拟地址0xf0000000-0xffffffff建立映射
+```asm
+pde_t entry_pgdir[NPDENTRIES] = {
+	// Map VA's [0, 4MB) to PA's [0, 4MB)
+	[0]
+		= ((uintptr_t)entry_pgtable - KERNBASE) + PTE_P,
+
+	// Map VA's [KERNBASE, KERNBASE+4MB) to PA's [0, 4MB)
+	[KERNBASE>>PDXSHIFT]
+		= ((uintptr_t)entry_pgtable - KERNBASE) + PTE_P + PTE_W
+};
+```
+##### exercise 7
+
+分别在运行 ```movl	%eax, %cr0``` 指令前后，观察虚拟内存中0x100000和0xf0100000地址里的数据
+
+* 可发现开启分页前后0x100000里的数据不变，也就是都存有内核的第一条指令
+* 但开启分页前0xf0100000里不存有数据，开启分页后由于经过映射，把0x100000中的数据映射到0xf0100000中，所以现在两个地址的数据相同
+
+![](fig/2023-11-19-16-30-02.png)
+
+#### 格式化输出到控制台
+
+主要看三个文件：kern/printf.c, kern/console.c 和 lib/printfmt.c
+
+终端调用的打印函数是kern/printf.c中的cprintf函数，而其中实际调用的是lib/printfmt.c中的vprintfmt函数，而其中的打印字符函数是kern/console.c中的cputchar函数
+
+##### exercise 8
+
+省略了一小段代码 - 使用“％o”形式的模式打印八进制数所需的代码。 查找并填写此代码片段。
+
+在ib/printfmt.c的vprintfmt函数中加入
+
+```c
+// （无符号）八进制
+case 'o':
+  putch('0', putdat)
+  num = getuint(&ap, lflag);
+  base = 8;
+  goto number;
+```
+
+可在kern/init.c的i386_init函数中添加自己的测试代码，如下（加label是为了能够在asm文件中定位到自己的新加代码，而且要记住该label要顶格写）
+
+```c
+// Lab 1 exercise 8 test
+{
+  int x = 1, y = 3, z = 4;
+
+Lab1_exercise8_3:
+  cprintf("x %d, y %x, z %d\n", x, y, z);
+}
+```
+
+另外，C函数调用实参的入栈顺序是从右到左的，才使得调用参数个数可变的函数成为可能(且不用显式地指出参数的个数)
+
+#### 堆栈
+
+##### 初始化
+
+确定内核在什么时候初始化了堆栈
+* entry.S 中的 ```movl	$(bootstacktop),%esp```。将一个宏变量bootstacktop的值赋值给了寄存器esp。而bootstacktop出现在bootstack下，bootstack出现在.data段下，这是数据段。可以肯定，这就是栈了
+
+堆栈所在内存的确切位置。
+* 查看反汇编文件，如下，可知栈顶位置为0xf0117000
+* **栈将向地址值更小的方向生长**，也就是栈顶比栈底的地址要小，将值压入堆栈涉及到堆栈指针-1，然后将值写入堆栈指针指向的位置。 从堆栈中弹出一个值包括读取堆栈指针指向的值，然后堆栈指针+1
+
+```asm
+movl	$(bootstacktop),%esp
+f0100034:	bc 00 70 11 f0       	mov    $0xf0117000,%esp
+```
+
+内核如何为其堆栈保留空间
+* 通过```.space```指令，在bootstack位置处初始化了KSTKSIZE这么多的空间。KSTKSIZE在inc/memlayout.h里面定义，是8*PGSIZE，而PGSIZE在inc/mmu.h中定义，值为4096。这样一顿找，我们知道了，栈在内核入口的汇编代码中初始化，是通过一个汇编指令.space，大小是8 * 4096
+
+##### 调用函数
+
+在执行新的函数callee代码之前，先保存旧函数caller的栈的位置。这样一来，callee才可以返回到正确的指令上。通过ebp基址指针寄存器的值，Debugger可以迅速找到调用这个函数的函数，一路找到最开始执行这个函数的函数，这种操作称为backtrace。
+
+看到反汇编代码obj/kern/kernel.asm中，所有C函数的第一个指令都是push %ebp，保存了旧的栈地址。第二个指令都是mov %esp, %ebp，将当前栈地址，也就是函数的栈的开头，保存到ebp。
+
+##### 函数返回
+
+函数返回时，寄存器eip，也就是Instruction Pointer，跳转到调用本函数的call指令的下一个指令，且esp增加。栈是向下增长的，所以这其实是在“弹出”。调用函数时，函数接受的参数都被压栈，故返回时相应弹出。
+
+> EIP存储着下一条指令的地址，每执行一条指令，该寄存器变化一次。
+> 
+> EBP存储着当前函数栈底的地址，栈低通常作为基址，我们可以通过栈底地址和偏移相加减来获取变量地址（很重要）。
+> 
+> ESP始终指向栈顶，只要ESP指向变了，那么当前栈顶就变了。
+
+##### exercise 10
+在obj/kern/kernel.asm找到test_backtrace函数，并设置断点。进行调试。
+
+每次回溯相当于x-1，最后x小于等于0时调用函数mon_backtrace，该函数需我们实现
+
+![](fig/2023-11-19-21-22-55.png)
+
+##### exercise 11
+编写mon_backtrace函数，使其输出如下
+
+![](fig/2023-11-19-21-47-56.png)
+
+* ebp是堆栈的基指针，也是调用函数的返回地址。调用函数返回之后，程序需要知道从哪里继续执行，因此，在调用函数之前，返回地址会被压入堆栈中，指示程序在函数执行完后应该返回的地址。
+* eip是调用函数里的第一条指令所对应的地址
+* args是函数调用时的参数
+* 可知，堆栈由栈顶到栈底依次是args、eip和ebp
+
+```c
+int
+mon_backtrace(int argc, char **argv, struct Trapframe *tf)
+{
+  // Your code here.
+  uint32_t *ebp;
+    ebp = (uint32_t *)read_ebp(); // 读ebp
+    cprintf("Stack backtrace:\n");
+    while(ebp!=0){
+        cprintf("  ebp %08x",ebp);
+        cprintf("  eip %08x  args",*(ebp+1));
+        cprintf("  args");
+        cprintf(" %08x", *(ebp+2));
+        cprintf(" %08x", *(ebp+3));
+        cprintf(" %08x", *(ebp+4));
+        cprintf(" %08x", *(ebp+5));
+        cprintf(" %08x\n", *(ebp+6));
+        ebp  = (uint32_t*) *ebp; // 调用函数返回，返回前一个调用函数所对应的堆栈的栈底
+    }
+  return 0;
+}
+```
+
+![](fig/2023-11-19-22-02-24.png)
