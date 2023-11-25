@@ -339,3 +339,25 @@ mon_backtrace(int argc, char **argv, struct Trapframe *tf)
 ```
 
 ![](fig/2023-11-19-22-02-24.png)
+
+## HW 1
+
+注意 homework 的工程是 xv6-public，而不是 JOS
+
+##### exercise：查看栈中的内容
+
+* 在运行完```make qemu-gdb```后，运行```make gdb```
+* 打断点在内存 0x1000c 处，为内核的入口指令，即```mov  %cr4,%eax```（与JOS不同）
+* 查看reg内存储信息
+* 详细查看esp及后面23个字的数据，也就是看了堆栈存储的从栈顶开始的24个字的数据
+
+![](fig/2023-11-25-22-45-04.png)
+
+* 为了解释栈中的内容都为什么，主要需要查看三个文件 bootasm.S, bootmain.c, and bootblock.asm
+* 第一行第一个地址 0x00007db8 是bootmain函数调用 entry函数的下一行代码的地址
+* 第五行第一个0x00007c4d是 bootmain 的返回地址
+* 其他夹在上述两个地址中间的应该就是bootmain函数中的push进栈的内容
+
+![](fig/2023-11-25-22-45-50.png)
+
+![](fig/2023-11-25-22-46-25.png)
