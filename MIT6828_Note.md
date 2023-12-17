@@ -16,7 +16,7 @@
 
 ---
 
-## Lab 1
+## Lab 1: C, Assembly, Tools, and Bootstrapping
 
 ### Part1. PC Bootstrap
 
@@ -340,7 +340,7 @@ mon_backtrace(int argc, char **argv, struct Trapframe *tf)
 
 ![](fig/2023-11-19-22-02-24.png)
 
-## HW 1
+## HW 1: Boot xv6
 
 注意 homework 的工程是 xv6-public，而不是 JOS
 
@@ -361,3 +361,143 @@ mon_backtrace(int argc, char **argv, struct Trapframe *tf)
 ![](fig/2023-11-25-22-45-50.png)
 
 ![](fig/2023-11-25-22-46-25.png)
+
+## HW 2: Shell
+
+参考：[https://blog.csdn.net/a747979985/article/details/95094094](https://blog.csdn.net/a747979985/article/details/95094094)
+
+下载 sh.c 后 gcc 编译生成可执行文件 hw2_test.exe，下载 t.sh，使用命令```./hw2_test < t.sh```报错，是因为redir，exec，pipe函数没有实现
+
+![](fig/2023-12-16-17-09-54.png)
+
+举个shell命令的例子：
+
+```c++
+ls > y // 把当前目录ls的文件列表输出到y中
+cat < y | sort | uniq | wc > y1 // “|” 是 管道命令：读取y的内容，然后将y的内容排序，去掉重复，统计字数行数，并把结果保存到y1
+cat y1 // 显示文件 y1 的内容
+vrm y1 // 删除文件 y1。
+ls | sort | uniq | wc // 列出当前目录的文件列表，经过排序、去重、统计行数后输出结果
+rm y // 删除文件 y
+```
+
+下面将补全sh.c中的代码，主要是填写runcmd函数中的case
+
+##### 执行单个命令（case ' '）
+
+如执行ls命令，但也要考虑ls命令是在二级目录或者三级目录中的情况
+
+```c++
+case ' ':
+  ecmd = (struct execcmd*)cmd;
+  if(ecmd->argv[0] == 0)
+    _exit(0);
+  // fprintf(stderr, "exec not implemented\n");
+  // Your code here (逻辑：若当前路径找不到该命令，则明确为在bin中找，若仍找不到，则继续明确为在/usr/bin中找)
+  // execv会停止执行当前的进程，并且以argv[0]应用进程替换被停止执行的进程，进程ID没有改变，argv为该进程参数，一般正常执行时该函数不会返回
+  if(execv(ecmd->argv[0],ecmd->argv)==-1){ 
+    char mypath[20]="/bin/";
+    strcat(mypath,ecmd->argv[0]);
+    if(execv(mypath,ecmd->argv)==-1){
+	    strcpy(mypath,"/usr/bin/");
+	    strcat(mypath, ecmd->argv[0]);
+	    if(execv(mypath,ecmd->argv)==-1){
+		    fprintf(stderr, "Command %s can't find\n", ecmd->argv[0]);
+		    _exit(0);
+	    }
+    }
+  }
+  break;
+```
+
+##### I/O重定向（case '>' 和 csar '<'）
+
+I/O 重定向是指将进程的输入和输出重定向到其他地方（如一些文件），而不是默认的标准输入（stdin）和标准输出（stdout）
+
+```c++
+case '>':
+case '<':
+  rcmd = (struct redircmd*)cmd;
+  // fprintf(stderr, "redir not implemented\n");
+  // Your code here ...(实现I/O的重定向，需先释放对应的文件描述符(close)，再通过打开需要重定向目标文件(open))
+  close(rcmd->fd);
+	if(open(rcmd->file, rcmd->flags, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)<0){
+      printf(stderr, "file %s can't find\n", rcmd->file);
+      _exit(0);
+	}
+  runcmd(rcmd->cmd);
+  break;
+```
+
+##### 实现进程间的管道通讯（csar '|'）
+
+管道和标准输入输出流的文件描述符的操作流程如下图
+
+![](fig/2023-12-17-15-28-06.png)
+
+```c++
+case '|':
+  pcmd = (struct pipecmd*)cmd;
+  // fprintf(stderr, "pipe not implemented\n");
+  // Your code here ...
+  // 建立一个缓冲区，并把缓冲区通过 fd 形式给程序调用。它将 p[0] 修改为缓冲区的读取端， p[1] 修改为缓冲区的写入端，p[0] 和 p[1] 都是文件描述符
+  if(pipe(p) < 0){ 
+    fprintf(stderr,"Fail to create a pipe\n");
+    _exit(0);
+  }
+  /* 子进程执行*/
+  if(fork1() == 0){// 这里判断的意思是，当前进程是子进程是执行括号下面的指令，否则不执行（因为子进程才会返回0）
+  //child one:read from stdin(0), write to the right end of pipe(p[1])
+    close(1); // 这里的1是stdin，关闭stdin，使用管道的写入端
+    // dup函数产生并返回与传入参数fd指向同一文件的fd，这意味着两个fd可以独立地操作同一个文件。产生的fd总是空闲的最小fd
+    dup(p[1]); // 这里是给管道写入端分配一个新的文件描述符给这个新的子进程
+    close(p[0]); // 关闭旧的管道读取端
+    close(p[1]); // 关闭旧的管道写入端
+    runcmd(pcmd->left); // 执行‘|’符号左边的命令
+  }
+  wait(&r);
+  /* 子进程执行 */
+  if(fork1() == 0){
+  //child two:read from the left end of pipe(p[0]), write to stdout(1)
+    close(0); // 这里的0是stdout
+    dup(p[0]); // 这里是给管道读取端分配一个新的文件描述符给这个新的子进程
+    close(p[0]); // 关闭旧的管道读取端
+    close(p[1]); // 关闭旧的管道写入端
+    runcmd(pcmd->right); // 执行‘|’符号右边的命令
+  }
+    /* 父进程，子进程都执行 */
+  close(p[0]);
+  close(p[1]);
+  wait(&r);
+  break;
+```
+
+最终效果 ```gcc -o mit_shell sh.c```
+
+![](fig/2023-12-17-15-39-40.png)
+
+#### 额外重点1：fork函数
+
+[看看这个，比较好理解](https://blog.csdn.net/cckluv/article/details/109169941)
+
+fork()函数用于创建一个进程，所创建的进程**复制父进程的代码段/数据段/BSS段/堆/栈等所有用户空间信息**，在内核中操作系统重新为其申请了一个PCB，并**使用父进程的PCB进行初始化**
+
+* 也就是新开的子进程将会和父进程并发进行，子进程开启后接下来执行的指令，与父进程接下来要执行的指令相同，且父子进程的现场一模一样
+
+* fork调用的一个奇妙之处就是它仅仅被调用一次，却能够返回两次，一次函数返回是在父进程中，另一次是在新开的子进程中，它可能有三种不同的返回值：
+  * 在父进程中，fork返回新创建子进程的进程ID
+  * 在子进程中，fork返回0
+  * 如果出现错误，fork返回一个负值
+
+* 经常通过代码```if(fork() == 0)```来判断当前进程是父进程还是子进程，若是子进程才会执行该if语句里面的命令，从此开始父子进程走向不同
+
+#### 额外重点2：IPC进程间通信方式
+
+主要有 1.管道，2.信号量，3.消息队列，4.共享内存四种通信方式
+
+[https://blog.csdn.net/skyroben/article/details/71513385](https://blog.csdn.net/skyroben/article/details/71513385)
+
+* 管道通常用于具有父子关系的进程之间或者在同一台主机上的相关进程之间。它是一种单向的，同步的通信机制，可以在父进程和子进程之间传输数据
+* 信号量是一种用于进程间同步和互斥的机制，可以用于控制对共享资源的访问。它可以实现进程间的互斥和同步，从而避免资源竞争和死锁
+* 消息队列允许一个进程向另一个进程发送数据块。消息队列提供了一种异步的通信机制，发送方和接收方可以独立地进行读写操作，不需要同时存在
+* 共享内存是一种高效的进程间通信方式，它允许多个进程访问同一块物理内存，从而可以直接读写共享数据，而无需数据的复制。共享内存通常用于需要高性能和低延迟的场景
