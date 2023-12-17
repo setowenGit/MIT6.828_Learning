@@ -1,0 +1,176 @@
+/* See COPYRIGHT for copyright information. */
+
+#include <inc/stdio.h>
+#include <inc/string.h>
+#include <inc/assert.h>
+
+#include <kern/monitor.h>
+#include <kern/console.h>
+#include <kern/pmap.h>
+#include <kern/kclock.h>
+#include <kern/env.h>
+#include <kern/trap.h>
+#include <kern/sched.h>
+#include <kern/picirq.h>
+#include <kern/cpu.h>
+//#include <kern/sched.c>
+#include <kern/spinlock.h>
+//#include <kern/lapic.c>
+//#include <kern/mpconfig.c>
+
+
+static void boot_aps(void);
+
+
+void
+i386_init(void)
+{
+	// Initialize the console.
+	// Can't call cprintf until after we do this!
+	cons_init();
+
+	cprintf("6828 decimal is %o octal!\n", 6828);
+
+	// Lab 2 memory management initialization functions
+	mem_init();
+
+	// Lab 3 user environment initialization functions
+	env_init();
+	trap_init();
+
+	// Lab 4 multiprocessor initialization functions
+	mp_init();
+	lapic_init();
+
+	// Lab 4 multitasking initialization functions
+	pic_init();
+
+	// Acquire the big kernel lock before waking up APs
+	// Your code here:
+    lock_kernel();
+	// Starting non-boot CPUs
+	boot_aps();
+
+	// Start fs.
+	ENV_CREATE(fs_fs, ENV_TYPE_FS);
+
+#if defined(TEST)
+	// Don't touch -- used by grading script!
+	ENV_CREATE(TEST, ENV_TYPE_USER);
+#else
+//	 Touch all you want.
+    ENV_CREATE(user_yield, ENV_TYPE_USER);
+    ENV_CREATE(user_yield, ENV_TYPE_USER);
+    ENV_CREATE(user_yield, ENV_TYPE_USER);
+#endif // TEST*
+
+	// Should not be necessary - drains keyboard because interrupt has given up.
+	kbd_intr();
+
+	// Schedule and run the first user environment!
+    sched_yield();
+}
+
+// While boot_aps is booting a given CPU, it communicates the per-core
+// stack pointer that should be loaded by mpentry.S to that CPU in
+// this variable.
+void *mpentry_kstack;
+
+// Start the non-boot (AP) processors.
+static void
+boot_aps(void)
+{
+	extern unsigned char mpentry_start[], mpentry_end[];
+	void *code;
+	struct CpuInfo *c;
+
+	// Write entry code to unused memory at MPENTRY_PADDR
+    // 将入口开始的代码写入到 MPENTRY_PADDR 空闲内存地址中
+	code = KADDR(MPENTRY_PADDR);
+	memmove(code, mpentry_start, mpentry_end - mpentry_start);
+
+	// Boot each AP one at a time
+    // 启动每一个AP
+	for (c = cpus; c < cpus + ncpu; c++) {
+		if (c == cpus + cpunum())  // We've started already.
+			continue;
+
+		// Tell mpentry.S what stack to use  告诉mpentry.S 使用的堆栈
+		mpentry_kstack = percpu_kstacks[c - cpus] + KSTKSIZE;
+		// Start the CPU at mpentry_start
+		lapic_startap(c->cpu_id, PADDR(code));
+		// Wait for the CPU to finish some basic setup in mp_main()
+        // 等待 CPU 在 mp_main() 中完成一些基本设置
+		while(c->cpu_status != CPU_STARTED)
+			;
+	}
+}
+
+// Setup code for APs
+void
+mp_main(void)
+{
+	// We are in high EIP now, safe to switch to kern_pgdir 
+	lcr3(PADDR(kern_pgdir));
+	cprintf("SMP: CPU %d starting\n", cpunum());
+
+	lapic_init();
+	env_init_percpu();// 加载GDT 以及 段描述符
+	trap_init_percpu();// 初始化并加载 所有CPU、TSS、和 IDT
+	xchg(&thiscpu->cpu_status, CPU_STARTED); // tell boot_aps() we're up
+
+	// Now that we have finished some basic setup, call sched_yield()
+	// to start running processes on this CPU.  But make sure that
+	// only one CPU can enter the scheduler at a time!
+	//
+	// Your code here:
+    lock_kernel();
+    sched_yield();
+}
+
+/*
+ * Variable panicstr contains argument to first call to panic; used as flag
+ * to indicate that the kernel has already called panic.
+ */
+const char *panicstr;
+
+/*
+ * Panic is called on unresolvable fatal errors.
+ * It prints "panic: mesg", and then enters the kernel monitor.
+ */
+void
+_panic(const char *file, int line, const char *fmt,...)
+{
+	va_list ap;
+
+	if (panicstr)
+		goto dead;
+	panicstr = fmt;
+
+	// Be extra sure that the machine is in as reasonable state
+	asm volatile("cli; cld");
+
+	va_start(ap, fmt);
+	cprintf("kernel panic on CPU %d at %s:%d: ", cpunum(), file, line);
+	vcprintf(fmt, ap);
+	cprintf("\n");
+	va_end(ap);
+
+dead:
+	/* break into the kernel monitor */
+	while (1)
+		monitor(NULL);
+}
+
+/* like panic, but don't */
+void
+_warn(const char *file, int line, const char *fmt,...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	cprintf("kernel warning at %s:%d: ", file, line);
+	vcprintf(fmt, ap);
+	cprintf("\n");
+	va_end(ap);
+}
