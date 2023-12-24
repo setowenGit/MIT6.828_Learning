@@ -501,3 +501,244 @@ fork()函数用于创建一个进程，所创建的进程**复制父进程的代
 * 信号量是一种用于进程间同步和互斥的机制，可以用于控制对共享资源的访问。它可以实现进程间的互斥和同步，从而避免资源竞争和死锁
 * 消息队列允许一个进程向另一个进程发送数据块。消息队列提供了一种异步的通信机制，发送方和接收方可以独立地进行读写操作，不需要同时存在
 * 共享内存是一种高效的进程间通信方式，它允许多个进程访问同一块物理内存，从而可以直接读写共享数据，而无需数据的复制。共享内存通常用于需要高性能和低延迟的场景
+
+## Lab 2:Memory Management
+
+首先需切换分支
+
+```c++
+git checkout lab2
+git merge lab1 // 需解冲突
+```
+
+我们将编写操作系统的内存管理代码，内存管理有两个组成部分
+* 第一个部分是内核的物理内存分配器，以致于内核可以分配和释放内存。 分配器将以4096字节为操作单位，称为一个页面。 我们的任务是维护一个数据结构，去记录哪些物理页面是空闲的，哪些是已分配的，以及共享每个已分配页面的进程数。 我们还要编写例程来分配和释放内存页面。
+* 内存管理的第二个组件是虚拟内存，它将内核和用户软件使用的虚拟地址映射到物理内存中的地址。 当指令使用内存时，x86硬件的内存管理单元（MMU）执行映射，查询一组页表。 我们根据任务提供的规范修改JOS以设置MMU的页面表。
+* lab2包含的新源文件：inc/memlayout.h, kern/pmap.c, kern/pmap.h, kern/kclock.h, kern/kclock.c
+  * memlayout.h描述了必须通过修改pmap.c进行实现的虚拟地址空间的布局
+  * memlayout.h和pmap.h定义您将使用的PageInfo结构来跟踪哪些页面是空闲的
+  * kclock.c和kclock.h操纵PC的电池支持的时钟和CMOS RAM硬件，其中BIOS记录了PC所含的物理内存量，以及其他事项。pmap.c中的代码需要读取此设备硬件以找出有多少物理内存，但是代码的那一部分不用您完成，您不需要知道CMOS硬件如何工作的详细信息。
+
+### Part 1. 物理内存页管理
+
+操作系统必须跟踪物理RAM的哪些部分是空闲的以及哪些是当前正在使用的。JOS以页为粒度管理PC的物理内存，以便它可以使用MMU映射和保护每个分配的内存
+
+现在，您将编写物理页面分配器(physical page allocator)。它通过结构体PageInfo对象的链接列表来跟踪哪些页面是空闲的，每个对象都对应于一个物理页面
+
+实现必须实现kern/pmap.c 中的以下函数
+* boot_alloc()
+* mem_init() (只在check_page_free_list(1)时调用)
+* page_init()
+* page_alloc()
+* page_free()
+* check_page_free_list() and check_page_alloc()（测试物理分页器）
+
+##### Page分配器
+
+Page分配器是以page为单位操作内存的，之后几乎所有管理内存的机制都是以page为单位。page就是将所有的内存地址分成长度相同的一个个区块，每个的长度都是4096字节。所有可以分配的内存都注册到一个链表中，通过分配器，可以方便地拿到一个未分配的page
+
+内存管理组件维护一个链表，称为free list，这个链表将所有未分配的page连起来。需要分配内存时，将链表头部对应的page返回，并将链表头部更新为链表中的下一个元素
+
+![](fig/2023-12-22-15-39-02.png)
+
+定义页描述符结构体（memlayout.h），数组中第i个成员代表内存中第i个page。故物理地址和数组索引很方便相换算。初始化时，形成一个链表，所有可分配的page都以struct PageInfo的形式存在于链表上。要通过分配器拿到一个page，也就是读取链表开头的节点，这个节点就对应一个page
+
+```c++
+struct PageInfo {
+	// 空闲列表中的下一页
+	struct PageInfo *pp_link;
+	// pp_ref是指使用page_alloc分配的页面，指向该页面的指针（通常在页表项中）的数量
+  // 使用pmap.c的boot_alloc在启动时分配的页面没有有效的引用计数域。
+	uint16_t pp_ref;
+};
+```
+
+**page_alloc**：内核的其他代码通过该函数从free list取出一个page，返回当前page_free_list指针，并零page_free_list指针指向原链表中的下一个元素、
+
+```c++
+struct PageInfo *
+page_alloc(int alloc_flags)
+{
+	// 若是没有空闲的内存了返回NULL
+	if(page_free_list == NULL){
+		return NULL;
+	}
+	struct PageInfo *pp = page_free_list; // 获得一个空闲页
+	page_free_list = page_free_list->pp_link; // 空闲页描述符指向下一个空闲的页
+	pp->pp_link = NULL; // 为了使page_free正常运行和准确判断，该页已经不是空闲了，所以它也不要指向下一个空闲页
+	if(alloc_flags & ALLOC_ZERO){
+		char *va = page2kva(pp); // 函数page2kva，接受一个PageInfo指针，返回得到相应page的虚拟地址
+		memset(va, 0, PGSIZE); // 初始化页
+	}
+	return pp;
+}
+```
+
+**page_free**：释放指定页
+
+```c++
+void
+page_free(struct PageInfo *pp)
+{
+	if (pp->pp_ref != 0 || pp->pp_link != NULL) { // 若其他地方仍在使用该页，或是该页面已经空闲了，则报错
+	    panic("Page double free or freeing a referenced page...\n");
+	}
+	pp->pp_link = page_free_list; // 将该页作为page_free_list
+	page_free_list = pp; // 之前的page_free_list跟在该页后面
+}
+```
+
+**boot_alloc**：page分配组件完成初始化之前，使用boot_alloc函数分配内存，pages数组就是这个函数分配的。
+* 函数接受一个参数，代表要多少字节内存，函数将这个字节数调整为离这个字节数最近的4096的整数倍，以求每次分配都是以page为单位的。
+* end指针是连接器产生的，可以看连接配置文件kern/kernel.ld的53行，GCC编译器中链接器脚本文件(.ld文件)用于设置堆空间大小、栈空间大小，然后根据应用的请求设置栈的位置 
+* boot分配器只能在page分配器初始化完成之前使用，之后一律使用page分配器
+
+```c++
+static void *
+boot_alloc(uint32_t n)
+{
+	static char *nextfree;	//  指向空闲内存的下一字节的虚拟地址 virtual address of next byte of free memory
+	char *result;
+	// 如果nextfree为null时(第一次调用该函数)，则初始化 nextfree
+	// 'end'是一个由链接器自动生成的指向内核bss段的末端的神奇符号，它是链接器没有分配给任何内核代码或全局变量的起始虚拟地址
+	if (!nextfree) {
+		extern char end[];
+		nextfree = ROUNDUP((char *) end, PGSIZE);
+	}
+	// 分配一个足以容纳'n'字节的内存块，然后赋给nextfree, 确保nextfree与PGSIZE的倍数保持一致
+	//
+	// LAB 2: Your code here.
+	// 如果n==0，返回下一个空闲页的地址，不分配任何东西
+	if (n == 0) {
+	    return nextfree;
+	}
+	// n > 0，可以分配内存，此时result就是返回的虚拟地址，然后更新nextfree指向下一个可以分配的内存的虚拟地址
+	result = nextfree;
+	nextfree = ROUNDUP(n, PGSIZE) + nextfree; 
+	// 申请的内存超了
+	if (nextfree > (char *)0xf0400000) {
+	    panic("boot_alloc: out of memory, nothing changed, returning NULL...\n");
+	    nextfree = result;    // reset static data
+	    return NULL;
+	}
+	return result;
+}
+```
+
+**page_init**：初始化空闲页链表
+
+* 在初始化内存组件的函数mem_init中，首先调用了函数i386_detect_memory获得了内存硬件信息，得到的内存信息是两个整数npages, npages_basemem，分别代表**现有内存**的page个数，以及在**拓展内存之前**的page个数
+* 在文件kern/memlayout.h中，有一个虚拟内存的布局示意图，主要描绘用户区内存分配，而不是指出物理内存分布，故我们暂时不细看它。地址0xf0000000以上的区域，也就是我们现在已经映射的区域，是我们关心的区域。宏KERNBASE就是0xf0000000，同时这个地址也是内核栈的开端。以下为了讲述方便，所有地址都是**物理内存**
+
+```c++
+/*
+ *                     .                              .
+ *                     .       Managable Space        .
+ *                     .                              .
+pages ends 0x158000 -->+------------------------------+
+ *                     |                              |
+ *                     .                              .
+ *                     .   pages management array     .
+ *                     .                              .
+ *                     |                              |
+ *  pages 0x118000 ->  +------------------------------+
+ *                     |        Kernel is here        |
+ *    EXT 0x100000 ->  +------------------------------+
+ *                     |                              |
+ *                     |          IO Hole             |
+ *                     |                              |
+ * BASEMEM 0xa0000 ->  +------------------------------+
+ *                     |    Basic Managable Space     |
+ *    KERNBASE ----->  +------------------------------+
+ */
+```
+
+1. 从KERNBASE开始想起。回顾Lab 1我们知道，内存0xf0000-0x100000是BIOS映射区，在这之前又是ROM映射区，这段空间不能使用，不能被分配器分配出去。在文件inc/memlayout.h中，宏IOPHYSMEM定义了这段IO段内存的开头
+2. 在IOPHYSMEM之前还有一些内存没有分配，这部分内存是可以使用的。函数i386_detect_memory得到的npages_basemem就是这一段的长度，初始化page分配器时应该包含这一段。可以验证一下，npages_basemem的值为160，总的page大小为160 * 4096 = 655360 = 0xa0000，确实是IOPHYSMEM
+3. 从0x100000开始以上的内存就是内核，可以回顾Lab 1中探索内核结构的结果，内核的.text区的虚拟地址为0xf0100000，物理地址正是0x100000。文件inc/memlayout.h中定义的宏EXTPHYSMEM就是0x100000，意思是BIOS以上的内存，称为拓展区，其上限由RAM硬件大小决定
+
+初始化后的空闲页链表图如下
+
+![](fig/2023-12-24-17-59-36.png)
+
+```c++
+void
+page_init(void)
+{
+	// 1）物理页第0页为已使用
+	// 	 这样我们就可以保留实模式下的 IDT 和 BIOS 结构。
+	// 	 以防万一我们需要它们。 (目前我们不需要，但是...)
+	pages[0].pp_ref = 0;
+    pages[0].pp_link = NULL;
+    page_free_list = &pages[0];
+	// 2) 剩下的基本内存，[PGSIZE, npages_basemem * PGSIZE)是空闲的
+	size_t i = 1;
+	for (; i < npages_basemem; i++) {
+		pages[i].pp_ref = 0; // 使用该页的数量初始化时都设为0 Don't mark reference count!
+		pages[i].pp_link = page_free_list; // 连接上一个空闲页 connect the previous page
+		page_free_list = &pages[i]; // 更新最新的空闲页为此页
+	}
+	// 3) 然后是IO专门分配空间[IOPHYSMEM, EXTPHYSMEM)，它肯定是无法被分配的。
+	// 4) 然后是扩展内存 [EXTPHYSMEM, ...)。
+	//	有些在使用中，有些是空闲的。内核位于物理内存中的哪个地方, 哪些页已经被使用于页表和其他数据结构？
+	// 分配给内核的内存之后的内存，也可以使用 extended pages after kernel
+	i = PADDR(boot_alloc(0)) / PGSIZE; // 确定内核内存段之后的可分配的页的索引
+	for (; i < npages; ++i) {
+        pages[i].pp_ref = 0;
+        pages[i].pp_link = page_free_list;
+        page_free_list = &pages[i];
+	}
+}
+```
+
+需用到的函数如下
+
+```c++
+// memlayout.h
+#define	KERNBASE	0xF0000000 // 虚拟地址对于物理地址的偏移
+
+// mmu.h
+#define PGSIZE		4096		// bytes mapped by a page 每一页为4096B
+#define PGSHIFT		12		// log2(PGSIZE) 对4096求2的对数（2的12次方为4096）
+
+// pmap.h
+// 返回页的虚拟地址kva对应的物理地址
+#define PADDR(kva) _paddr(__FILE__, __LINE__, kva)
+static inline physaddr_t
+_paddr(const char *file, int line, void *kva)
+{
+	if ((uint32_t)kva < KERNBASE)
+		_panic(file, line, "PADDR called with invalid kva %08lx", kva);
+	return (physaddr_t)kva - KERNBASE;
+}
+// 返回页的物理地址pa对应的虚拟地址
+#define KADDR(pa) _kaddr(__FILE__, __LINE__, pa)
+static inline void*
+_kaddr(const char *file, int line, physaddr_t pa)
+{
+	if (PGNUM(pa) >= npages)
+		_panic(file, line, "KADDR called with invalid pa %08lx", pa);
+	return (void *)(pa + KERNBASE);
+}
+// 返回该页指针所对应的物理地址
+static inline physaddr_t
+page2pa(struct PageInfo *pp)
+{
+	return (pp - pages) << PGSHIFT;
+}
+// 返回该页物理地址所对应的页指针
+static inline struct PageInfo*
+pa2page(physaddr_t pa)
+{
+	if (PGNUM(pa) >= npages)
+		panic("pa2page called with invalid pa");
+	return &pages[PGNUM(pa)];
+}
+// 接受一个PageInfo指针，返回得到相应page的虚拟地址
+static inline void*
+page2kva(struct PageInfo *pp)
+{
+	return KADDR(page2pa(pp));
+}
+```
+
