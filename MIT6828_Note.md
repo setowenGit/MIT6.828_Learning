@@ -502,7 +502,7 @@ fork()函数用于创建一个进程，所创建的进程**复制父进程的代
 * 消息队列允许一个进程向另一个进程发送数据块。消息队列提供了一种异步的通信机制，发送方和接收方可以独立地进行读写操作，不需要同时存在
 * 共享内存是一种高效的进程间通信方式，它允许多个进程访问同一块物理内存，从而可以直接读写共享数据，而无需数据的复制。共享内存通常用于需要高性能和低延迟的场景
 
-## Lab 2:Memory Management
+## Lab 2: Memory Management
 
 首先需切换分支
 
@@ -533,8 +533,6 @@ git merge lab1 // 需解冲突
 * page_free()
 * check_page_free_list() and check_page_alloc()（测试物理分页器）
 
-##### Page分配器
-
 Page分配器是以page为单位操作内存的，之后几乎所有管理内存的机制都是以page为单位。page就是将所有的内存地址分成长度相同的一个个区块，每个的长度都是4096字节。所有可以分配的内存都注册到一个链表中，通过分配器，可以方便地拿到一个未分配的page
 
 内存管理组件维护一个链表，称为free list，这个链表将所有未分配的page连起来。需要分配内存时，将链表头部对应的page返回，并将链表头部更新为链表中的下一个元素
@@ -545,11 +543,13 @@ Page分配器是以page为单位操作内存的，之后几乎所有管理内存
 
 ```c++
 struct PageInfo {
-	// 空闲列表中的下一页
-	struct PageInfo *pp_link;
-	// pp_ref是指使用page_alloc分配的页面，指向该页面的指针（通常在页表项中）的数量
+  // 空闲列表中的下一页
+  struct PageInfo *pp_link;
+  // pp_ref是指使用page_alloc分配的页面，指向该页面的指针（通常在页表项中）的数量
+  // 通常会同时在多个虚拟地址（或在多个环境的地址空间中）映射相同的物理页面，pp_ref就是统计该物理页面被引用的次数
   // 使用pmap.c的boot_alloc在启动时分配的页面没有有效的引用计数域。
-	uint16_t pp_ref;
+  // 当物理页面的计数为零时，可以释放该页面，因为它不再被使用
+  uint16_t pp_ref;
 };
 ```
 
@@ -742,3 +742,66 @@ page2kva(struct PageInfo *pp)
 }
 ```
 
+### Part 2. 内核内存映射
+
+x86内存管理机制：弄清楚x86的内存管理机制，是本文的核心，也是这个Lab的核心。
+
+x86建立了两次映射，程序给出地址，经过这两次翻译之后，才输出从到总线交给内存芯片。这两次映射分别为 **Segment Translation** 和 **Page Translation** 
+* Segment Translation将虚拟地址转化为线性地址Linear Address
+* Page Translation将线性地址转化为物理地址，也就是真正用来索引内存的物理地址
+* 在本项目中，还没有做Segment Translation映射虚拟地址的处理，所以线性地址和虚拟地址相同
+
+##### Segment Translation
+
+Segment Translation的过程可以如下图表示，由一个事先指定的selector选择器，从一个描述符表descriptor table中读出一个描述符descriptor。由这个描述符读出一个基地址base address，虚拟地址作为一种偏置offset，加到基地址上，就得到了linear address
+
+![](fig/2023-12-24-22-07-57.png)
+
+* 描述符表Descriptor Table：描述符表必须事先指定，虚拟地址中不包含关于描述符表的信息。有两种描述符表，分别为全局描述符表Global Descriptor Table (GDT)和本地描述符表Local Descriptor Table (LDT)，分别使用寄存器GDTR, LDTR获得
+* 描述符Descriptor：通过selector索引描述符表得到的描述符，除了基地址之外，也包含了其他信息。这是两种不同的结构，其中的区别只有DPL和TYPE之间的那个bit，以及TYPE的位置。这里需要注意的是P域，也就是Segment Present bit，表示这个segment是否在内存中，之后的Page Translation也有类似机制
+
+![](fig/2023-12-24-22-10-06.png)
+
+* 选择符Selector：选择符不但有描述符表的索引，还有选择描述符表GDT/LDT的bit，以及发出的请求所在的优先级，用于区分User Level Access和Kernel Level Access
+
+![](fig/2023-12-24-22-10-52.png)
+
+* 和segment有关的寄存器：虚拟地址只是一个segment的偏置，本身不包含和segment有关的信息。当前使用的描述符表、描述符选择符，都要另外存储在一些寄存器里面。当使用和跳转有关的指令call, jmp时，这些寄存器被隐式地访问了，从而帮助计算新的地址。segment寄存器有两个部分，可以直接操作和读取的是16bit的selector域，修改selector域之后，硬件自动将对应的描述符从描述符表中读取进不显示的descriptor域，这样就方便了后续操作
+
+![](fig/2023-12-24-22-11-50.png)
+
+##### Page Translation
+
+虚拟地址，也就是线性地址，被拆成了三部分，都是一种索引index，分别索引的是Page Directory, Page Table, Page Frame
+* 利用DIR从page directory中读出DIR Entry，进而得到page table 的地址
+* 再利用PAGE从读到的page table地址中读到PG TBL Entry，进而得到page frame的地址
+* 最后利用OFFSET索引page frame之后，就得到相应物理地址上的内容
+* 另外，只有当设置了CR0的PG位时，页面转换才有效
+
+对于开发者来说，page directory, page table都是两个数组，拿到page directory的头部指针，和虚拟地址一起，就可以确定物理地址
+
+![](fig/2023-12-24-22-12-25.png)
+
+线性地址，也就是虚拟地址，的格式如下
+
+![](fig/2023-12-24-22-16-45.png)
+
+每个域包含bit的个数，也就是长度，决定了每个域对应的数组的长度。我们可以很方便地得到每个域对应的长度：
+
+```
+page_len = 2 ** 12 = 4096            // OFFSET
+page_table_len = 2 ** 10 = 1024      // PAGE
+page_dir_len = 2 ** 10 = 1024        // DIR
+```
+
+所以一个page directory指向1024个page directory entry，一个page directory entry指向了1024个page table，一个page table entry指向了1024个page frame，一个page frame中包含4096Bytes
+
+page directory entry, page table entry具有相同格式，如下：
+
+![](fig/2023-12-24-22-18-10.png)
+
+DIR, PAGE域长度相同，而entry的格式也相同，说明page directory和page table其实是相同结构的嵌套。可以把page directory理解为高一级的page table，整个内存管理形成两个层级。一个page table自身就是一个page，是有page directory管理的，而page table又管理了page frame
+
+对于page directory来说，entry中12-31位上的PAGE FRAME ADDRESS就是一个page table的基地址。对于page table来说，这个地址是一个page frame的基地址。通过一个虚拟地址，获得3个索引，一次访问这3个结构，就可以得到物理地址了
+
+这里还要注意一下，bit 0是Present Bit，表示当前entry中的信息是否可以用于映射。要是Present Bit设置为0，则这个entry不包含有效信息。索引各种page directory/table时，必须先检查这个bit
