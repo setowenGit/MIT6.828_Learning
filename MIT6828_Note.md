@@ -12,6 +12,8 @@
 
 ##### [知乎参考](https://zhuanlan.zhihu.com/p/166413604)
 
+##### [Github参考3](https://github.com/yunwei37/6.828-2018-labs?tab=readme-ov-file)
+
 ##### [实验环境配置(其他报错问题可看评论区)](https://blog.csdn.net/Rcary/article/details/125547980?utm_source=app&app_version=4.17.0)
 
 ---
@@ -525,9 +527,8 @@ git merge lab1 // 需解冲突
 
 现在，您将编写物理页面分配器(physical page allocator)。它通过结构体PageInfo对象的链接列表来跟踪哪些页面是空闲的，每个对象都对应于一个物理页面
 
-实现必须实现kern/pmap.c 中的以下函数
+实现kern/pmap.c 中的以下函数
 * boot_alloc()
-* mem_init() (只在check_page_free_list(1)时调用)
 * page_init()
 * page_alloc()
 * page_free()
@@ -698,11 +699,12 @@ page_init(void)
 #define	KERNBASE	0xF0000000 // 虚拟地址对于物理地址的偏移
 
 // mmu.h
+#define PGNUM(la)	(((uintptr_t) (la)) >> PTXSHIFT) // 计算la是第几页
 #define PGSIZE		4096		// bytes mapped by a page 每一页为4096B
 #define PGSHIFT		12		// log2(PGSIZE) 对4096求2的对数（2的12次方为4096）
 
 // pmap.h
-// 返回页的虚拟地址kva对应的物理地址
+// 将内核虚拟地址kva转成对应的物理地址
 #define PADDR(kva) _paddr(__FILE__, __LINE__, kva)
 static inline physaddr_t
 _paddr(const char *file, int line, void *kva)
@@ -711,7 +713,7 @@ _paddr(const char *file, int line, void *kva)
 		_panic(file, line, "PADDR called with invalid kva %08lx", kva);
 	return (physaddr_t)kva - KERNBASE;
 }
-// 返回页的物理地址pa对应的虚拟地址
+// 将物理地址pa转化为内核虚拟地址
 #define KADDR(pa) _kaddr(__FILE__, __LINE__, pa)
 static inline void*
 _kaddr(const char *file, int line, physaddr_t pa)
@@ -720,13 +722,13 @@ _kaddr(const char *file, int line, physaddr_t pa)
 		_panic(file, line, "KADDR called with invalid pa %08lx", pa);
 	return (void *)(pa + KERNBASE);
 }
-// 返回该页指针所对应的物理地址
+// 通过空闲页结构得到这一页起始位置的物理地址
 static inline physaddr_t
 page2pa(struct PageInfo *pp)
 {
 	return (pp - pages) << PGSHIFT;
 }
-// 返回该页物理地址所对应的页指针
+// 通过物理地址pa获取这一页对应的页结构体struct PageInfo
 static inline struct PageInfo*
 pa2page(physaddr_t pa)
 {
@@ -734,7 +736,7 @@ pa2page(physaddr_t pa)
 		panic("pa2page called with invalid pa");
 	return &pages[PGNUM(pa)];
 }
-// 接受一个PageInfo指针，返回得到相应page的虚拟地址
+// 通过空闲页结构得到这一页起始位置的虚拟地址
 static inline void*
 page2kva(struct PageInfo *pp)
 {
@@ -782,6 +784,13 @@ Segment Translation的过程可以如下图表示，由一个事先指定的sele
 
 ![](fig/2023-12-24-22-12-25.png)
 
+| 名字 | 作用  |
+|------|----------------------------------------|
+| PAGE DIRECTORY | 存放各个DIR ENTRY的表，其物理地址存在寄存器CR3中  |
+| DIR ENTRY | 其高20位存放各PAGE TABLE的对应的物理地址的高20位                         |
+| PAGE TABLE   | 存放PG TBL ENTRY                                  |
+| PG TBL ENTRY  | 其高20位存放各页的对应的物理地址的高20位              |
+
 线性地址，也就是虚拟地址，的格式如下
 
 ![](fig/2023-12-24-22-16-45.png)
@@ -805,3 +814,344 @@ DIR, PAGE域长度相同，而entry的格式也相同，说明page directory和p
 对于page directory来说，entry中12-31位上的PAGE FRAME ADDRESS就是一个page table的基地址。对于page table来说，这个地址是一个page frame的基地址。通过一个虚拟地址，获得3个索引，一次访问这3个结构，就可以得到物理地址了
 
 这里还要注意一下，bit 0是Present Bit，表示当前entry中的信息是否可以用于映射。要是Present Bit设置为0，则这个entry不包含有效信息。索引各种page directory/table时，必须先检查这个bit
+
+需要注意的一点就是虚拟地址和物理地址的类型，我们只能对虚拟地址解引用，对物理地址解引用会得到未定义的结果：
+
+ C type |	Address type 
+ -|-
+ T*  |	Virtual
+uintptr_t | 	Virtual
+physaddr_t  |	Physical
+
+实现kern/pmap.c 中的以下函数：
+* pgdir_walk()
+* boot_map_region()
+* page_lookup()
+* page_remove()
+* page_insert()
+
+**pgdir_walk**：接受一个page directory和一个虚拟地址，要求得到虚拟地址在这个page directory下对应的page table entry
+
+```c++
+// 用于pgdir_walk函数，根据PAGE DIR ENTRY创建page table
+static struct PageInfo *create_pgtbl(pde_t *pde) {
+  struct PageInfo *pageInfo;
+  pageInfo = page_alloc(ALLOC_ZERO); // 取出一个空闲页，作为page table
+  if (pageInfo == NULL) {
+      // 取出失败
+      return NULL;
+  }
+  // 该空闲页的引用数必须加1
+  pageInfo->pp_ref += 1;
+  // 获取该page table对应的物理地址，该物理地址经过下一步的处理后成为dir entry
+  *pde = page2pa(pageInfo);
+  // 设置dir entry为有效，且是用户级，且是写操作
+  *pde |= PTE_U | PTE_P | PTE_W;
+  return pageInfo;
+}
+
+pte_t *
+pgdir_walk(pde_t *pgdir, const void *va, int create)
+{
+  uintptr_t pdx = PDX(va); // DIR
+  uintptr_t ptx = PTX(va); // PAGE
+  uintptr_t pgoff = PGOFF(va); // OFFSET
+
+  pde_t *pde = &pgdir[pdx]; // 根据DIR字段和PAGE DIRECTORY获取DIR ENTRY
+
+  if (!*pde & PTE_P) { // DIR ENTRY中的Present Bit为0,表示对应的page table无效
+      if (create) {// 该page table不存在，需要创建
+          // 创建page table，并返回该页结构体，pde现在是dir entry
+          struct PageInfo *pageInfo = create_pgtbl(pde);
+          if (pageInfo == NULL) {
+              // 分配页失败
+              return NULL;
+          }
+      } else {
+          return NULL;
+      }
+  }
+  // 获取PAGE TABLE的物理基址，并转化为虚拟地址
+  pte_t *pgtbl = (pte_t *)KADDR(PTE_ADDR(*pde));
+  // 获得PG TBL ENTRY
+  pte_t *pte = &pgtbl[ptx];
+	return pte;
+}
+```
+
+**boot_map_region**: 将虚拟地址中的size个page映射到连续的物理地址上
+```c++
+static void
+boot_map_region(pde_t *pgdir, uintptr_t va, size_t size, physaddr_t pa, int perm)
+{
+	uintptr_t oldva = va; // 存下起始虚拟地址
+    for (; va - oldva < size; va += PGSIZE, pa += PGSIZE) { // 遍历size个虚拟地址
+        pte_t *pte = pgdir_walk(pgdir, (void *)va, 1); // 获取PG TBL ENTRY
+        *pte = pa | perm | PTE_P; // 设置PG TBL ENTRY
+    }
+}
+```
+
+**page_lookup**: 通过虚拟地址取出对应page的页结构体
+```c++
+struct PageInfo *
+page_lookup(pde_t *pgdir, void *va, pte_t **pte_store)
+{
+	pte_t *pte = pgdir_walk(pgdir, va, 0); // 获取PG TBL ENTRY
+	if (pte == NULL) {
+	  return NULL;
+	}
+  if(!(*pte & PTE_P)){
+		return NULL;
+	}
+	// 如果pte_store不是null，那么我们将该页面的pte地址存储在其中
+	// 这将被page_remove使用，并可用于验证syscall参数的页面权限
+	if (pte_store) {
+	    *pte_store = pte;
+	}
+	// 首先获取PG TBL ENTRY的高20位，即PAGE FRAME的物理地址基址
+	// 再从该物理地址获取对应页的结构体
+    struct PageInfo *pageInfo = pa2page(PTE_ADDR(*pte));
+	return pageInfo;
+}
+```
+
+**page_remove**: 从Page Table中删除一项，即删除一个page frame映射
+```c++
+void
+page_remove(pde_t *pgdir, void *va)
+{
+	pte_t *pte;
+	struct PageInfo *pageInfo = page_lookup(pgdir, va, &pte); // 找到对应页的结构体
+	if (pageInfo == NULL) {
+	    return;
+	}
+	page_decref(pageInfo); // 该页的引用数减1,若减后为0,则释放该页
+	*pte = 0; // 清空PG TBL ENTRY
+	tlb_invalidate(pgdir, va); // TLB缓存失效
+}
+```
+
+**page_insert**: 在Page Table中增加一项pg tbl entry，即建立一个新的page frame映射，和之前的boot_map_region不同，这个映射不是静态映射，是将来要使用的，必须增加引用计数
+
+需要注意的是：有两种特殊情况，一种是pg tbl entry已经存在，且将要建立的映射已经建立；第二种是pg tbl entry已经存在，但里面的映射不是现在我们想要的映射，这时候需要重新映射
+
+```c++
+int
+page_insert(pde_t *pgdir, struct PageInfo *pp, void *va, int perm)
+{
+	pte_t *pte = pgdir_walk(pgdir, va, 1); // 获取PG TBL ENTRY
+	if (pte == NULL) {
+	    return -E_NO_MEM; // 分配失败
+	}
+	if (*pte & PTE_P) { // 若该pg tb entry已经被映射
+		// （1）已经建立了将要建立的映射
+		// 同一个物理地址页重新插入到在同一个pg dir中的同一个虚拟地址
+		// 此时引用数减1,在之后会重新加上1,相当于没有改变
+	    if (PTE_ADDR(*pte) == page2pa(pp)) { 
+	        --pp->pp_ref;
+	    }
+		// (2）已经存在映射
+		// 不同的物理地址页要插入到已经存有物理地址的pg tbl entry
+		// 也就是重映射，这时候先删除旧的映射
+	    else {
+            page_remove(pgdir, va);
+        }
+	}
+	++pp->pp_ref; // 该页引用数加1
+	*pte = page2pa(pp) | perm | PTE_P; // 设置pg tbl entry，也就是建立映射
+	return 0;
+}
+```
+
+需用到的函数如下
+```c++
+// mmu.h
+// 线性地址的DIR字段
+#define PDX(la)		((((uintptr_t) (la)) >> PDXSHIFT) & 0x3FF)
+// 线性地址的PAGE字段
+#define PTX(la)		((((uintptr_t) (la)) >> PTXSHIFT) & 0x3FF)
+// 线性地址的OFFSET字段
+#define PGOFF(la)	(((uintptr_t) (la)) & 0xFFF)
+// 从DIR ENTRY或PG TBL ENTRY中获取高20位，即获得对应的PAGE TABLE基址或者物理地址基址
+#define PTE_ADDR(pte)	((physaddr_t) (pte) & ~0xFFF)
+```
+
+### Part 3. 初始化内核地址空间
+
+实现函数 mem_init.c
+
+**mem_init**: 建立一个二级页表,需要按要求进行映射，如下
+
+```
+/*
+ * Virtual memory map:                                Permissions
+ *                                                    kernel/user
+ *
+ *    4 Gig -------->  +------------------------------+
+ *                     |                              | RW/--
+ *                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *                     :              .               :
+ *                     :              .               :
+ *                     :              .               :
+ *                     |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~| RW/--
+ *                     |                              | RW/--
+ *                     |   Remapped Physical Memory   | RW/--
+ *                     |                              | RW/--
+ *    KERNBASE, ---->  +------------------------------+ 0xf0000000      --+
+ *    KSTACKTOP        |     CPU0's Kernel Stack      | RW/--  KSTKSIZE   |
+ *                     | - - - - - - - - - - - - - - -|                   |
+ *                     |      Invalid Memory (*)      | --/--  KSTKGAP    |
+ *                     +------------------------------+                   |
+ *                     |     CPU1's Kernel Stack      | RW/--  KSTKSIZE   |
+ *                     | - - - - - - - - - - - - - - -|                 PTSIZE
+ *                     |      Invalid Memory (*)      | --/--  KSTKGAP    |
+ *                     +------------------------------+                   |
+ *                     :              .               :                   |
+ *                     :              .               :                   |
+ *    MMIOLIM ------>  +------------------------------+ 0xefc00000      --+
+ *                     |       Memory-mapped I/O      | RW/--  PTSIZE
+ * ULIM, MMIOBASE -->  +------------------------------+ 0xef800000
+ *                     |  Cur. Page Table (User R-)   | R-/R-  PTSIZE
+ *    UVPT      ---->  +------------------------------+ 0xef400000
+ *                     |          RO PAGES            | R-/R-  PTSIZE
+ *    UPAGES    ---->  +------------------------------+ 0xef000000
+ *                     |           RO ENVS            | R-/R-  PTSIZE
+ * UTOP,UENVS ------>  +------------------------------+ 0xeec00000
+ * UXSTACKTOP -/       |     User Exception Stack     | RW/RW  PGSIZE
+ *                     +------------------------------+ 0xeebff000
+ *                     |       Empty Memory (*)       | --/--  PGSIZE
+ *    USTACKTOP  --->  +------------------------------+ 0xeebfe000
+ *                     |      Normal User Stack       | RW/RW  PGSIZE
+ *                     +------------------------------+ 0xeebfd000
+ *                     |                              |
+ *                     |                              |
+ *                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *                     .                              .
+ *                     .                              .
+ *                     .                              .
+ *                     |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|
+ *                     |     Program Data & Heap      |
+ *    UTEXT -------->  +------------------------------+ 0x00800000
+ *    PFTEMP ------->  |       Empty Memory (*)       |        PTSIZE
+ *                     |                              |
+ *    UTEMP -------->  +------------------------------+ 0x00400000      --+
+ *                     |       Empty Memory (*)       |                   |
+ *                     | - - - - - - - - - - - - - - -|                   |
+ *                     |  User STAB Data (optional)   |                 PTSIZE
+ *    USTABDATA ---->  +------------------------------+ 0x00200000        |
+ *                     |       Empty Memory (*)       |                   |
+ *    0 ------------>  +------------------------------+                 --+
+ *
+ * (*) Note: The kernel ensures that "Invalid Memory" is *never* mapped.
+ *     "Empty Memory" is normally unmapped, but user programs may map pages
+ *     there if desired.  JOS user programs map pages temporarily at UTEMP.
+ */
+```
+
+
+
+```c++
+void
+mem_init(void)
+{
+	uint32_t cr0;
+	size_t n;
+
+	// 获取机器有多少内存（npages & npages_basemem）
+	i386_detect_memory();
+
+	// 当你准备测试这个函数时，删除这一行。
+	// panic("mem_init: This function is not finished\n");
+
+	// 创建初始页面目录。
+	kern_pgdir = (pde_t *) boot_alloc(PGSIZE);
+	memset(kern_pgdir, 0, PGSIZE);
+
+	// 递归地将页目录作为页表插入自身，以在虚拟地址UVPT处形成一个虚拟页表。
+	// (目前，您没必要理解下面这句话的更深的意义。)
+
+	// Permissions: kernel R, user R
+	kern_pgdir[PDX(UVPT)] = PADDR(kern_pgdir) | PTE_U | PTE_P;
+
+	// 分配 npages 个的'struct PageInfo'结构的数组，并将其存储在'pages'中。
+    /* 内核使用这个数组来跟踪物理页面：每个物理页面，在这个数组中都有一个相应的结构PageInfo。
+       npages是内存中物理页的数量。 使用memset来初始化每个结构PageInfo的所有字段为0 */
+	// Your code goes here:
+	pages = (struct PageInfo*)boot_alloc(npages * sizeof(struct PageInfo));
+	memset(pages, 0, npages * sizeof(struct PageInfo));
+
+	/* 现在我们已经分配了初始的内核数据结构，我们设置了空闲物理页的列表。
+		一旦我们这样做了，所有进一步的内存管理将通过page_*函数进行。
+		特别是，我们现在可以使用 boot_map_region 或 page_insert 来映射内存。*/
+	page_init();
+
+	check_page_free_list(1);
+	check_page_alloc();
+	check_page();
+
+	//////////////////////////////////////////////////////////////////////
+	// Now we set up virtual memory
+
+	// 在线性地址UPAGES处映射用户只读的 "页面"
+	// 权限:
+	// -在 UPAGES 处的新映像 -- 内核R，用户R(即 perm = PTE_U | PTE_P)
+	// -页面本身 -内核RW，用户NONE
+	// Your code goes here:
+	boot_map_region(kern_pgdir, UPAGES, npages * sizeof(struct PageInfo), PADDR(pages), PTE_U);
+
+	// 使用'bootstack'所指的物理内存地址作为内核栈。 
+	// 内核堆栈从虚拟地址 KSTACKTOP 向下扩展。
+	// 我们考虑[KSTACKTOP-PTSIZE，KSTACKTOP]的整个范围 4MB
+	// 作为内核堆栈，但将其分为两部分：
+	// 		* [KSTACKTOP-KSTKSIZE, KSTACKTOP) -- 由物理内存支持的 32KB
+	// 		* [KSTACKTOP-PTSIZE, KSTACKTOP-KSTKSIZE) --不被支持, 4MB - 32KB
+	//		  所以如果内核溢出其堆栈，它将出现故障而不是覆盖溢出堆栈的内存空间.这样被称为 "保护页"。
+	// 
+	// 		  权限：内核RW，用户NONE
+	// Your code goes here:
+	boot_map_region(kern_pgdir, KSTACKTOP - KSTKSIZE, KSTKSIZE, PADDR(bootstack), PTE_W);
+
+	// 在KERNBASE处映射所有的物理内存.
+	// 即VA范围[KERNBASE, 2^32)应该映射到PA范围[0, 2^32 - KERNBASE)
+	// 我们可能没有2^32 - KERNBASE字节的物理内存，但是我们还是设置了这个映射。
+	// 权限：内核RW，用户NONE
+	// Your code goes here:
+	boot_map_region(kern_pgdir, KERNBASE, 0xffffffff - KERNBASE, 0, PTE_W);
+
+	// Check that the initial page directory has been set up correctly.
+	// 检查初始页面目录是否已经正确设置。
+	check_kern_pgdir();
+
+	// 从最小的入口页面目录切换到我们刚刚创建的完整的kern_pgdir的页表。	
+	// 我们的指令指针现在应该在KERNBASE和KERNBASE+4MB之间,这两个页表的映射方式是一样的。
+	// 如果机器在这时重新启动，你可能把你的kern_pgdir设置错了。
+	lcr3(PADDR(kern_pgdir));
+
+	check_page_free_list(0);
+
+	// entry.S设置cr0中真正重要的标志（包括启用paging） 
+	// 这里我们配置其余有意义的标志。
+	cr0 = rcr0();
+	cr0 |= CR0_PE|CR0_PG|CR0_AM|CR0_WP|CR0_NE|CR0_MP;
+	cr0 &= ~(CR0_TS|CR0_EM);
+	lcr0(cr0);
+
+	// 还有一些检查，只有在安装了kern_pgdir之后才能进行。
+	check_page_installed_pgdir();
+}
+```
+
+![](fig/2024-01-06-16-05-47.png)
+
+需用到的函数如下
+```c++
+// mmu.h
+#define PTSIZE		(PGSIZE*NPTENTRIES) // page directory 4096 * 1024 = 4MB
+#define PTE_W		0x002	// Writeable
+#define PTE_U		0x004	// User
+// memlayout.h
+#define KSTACKTOP	KERNBASE  // 内核栈
+#define KSTKSIZE	(8*PGSIZE)  // 内核栈空间 32KB
+#define UPAGES		(UVPT - PTSIZE) // 页面结构的只读副本
+```
