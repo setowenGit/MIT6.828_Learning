@@ -532,7 +532,6 @@ git merge lab1 // 需解冲突
 * page_init()
 * page_alloc()
 * page_free()
-* check_page_free_list() and check_page_alloc()（测试物理分页器）
 
 Page分配器是以page为单位操作内存的，之后几乎所有管理内存的机制都是以page为单位。page就是将所有的内存地址分成长度相同的一个个区块，每个的长度都是4096字节。所有可以分配的内存都注册到一个链表中，通过分配器，可以方便地拿到一个未分配的page
 
@@ -554,7 +553,7 @@ struct PageInfo {
 };
 ```
 
-**page_alloc**：内核的其他代码通过该函数从free list取出一个page，返回当前page_free_list指针，并零page_free_list指针指向原链表中的下一个元素、
+**page_alloc**：内核的其他代码通过该函数从free list取出一个page，返回当前page_free_list指针，并令page_free_list指针指向原链表中的下一个元素、
 
 ```c++
 struct PageInfo *
@@ -601,13 +600,12 @@ boot_alloc(uint32_t n)
 	static char *nextfree;	//  指向空闲内存的下一字节的虚拟地址 virtual address of next byte of free memory
 	char *result;
 	// 如果nextfree为null时(第一次调用该函数)，则初始化 nextfree
-	// 'end'是一个由链接器自动生成的指向内核bss段的末端的神奇符号，它是链接器没有分配给任何内核代码或全局变量的起始虚拟地址
+	// 'end'是一个由链接器自动生成的指向内核bss段的末端的神奇符号，它是链接器没有分配给任何内核代码或全局变量时的起始虚拟地址
 	if (!nextfree) {
 		extern char end[];
 		nextfree = ROUNDUP((char *) end, PGSIZE);
 	}
 	// 分配一个足以容纳'n'字节的内存块，然后赋给nextfree, 确保nextfree与PGSIZE的倍数保持一致
-	//
 	// LAB 2: Your code here.
 	// 如果n==0，返回下一个空闲页的地址，不分配任何东西
 	if (n == 0) {
@@ -654,7 +652,19 @@ pages ends 0x158000 -->+------------------------------+
  */
 ```
 
-1. 从KERNBASE开始想起。回顾Lab 1我们知道，内存0xf0000-0x100000是BIOS映射区，在这之前又是ROM映射区，这段空间不能使用，不能被分配器分配出去。在文件inc/memlayout.h中，宏IOPHYSMEM定义了这段IO段内存的开头
+> 三个常用段
+> 
+> .text 代码段：程序中的可执行部分，是由函数堆叠而成的
+> 
+> .data 数据段(数据区、静态数据区、静态区)：程序中的数据，C语言中的全局变量（全局变量才算程序的数据，局部变量是函数的数据）
+>
+> .bss bss段(ZI段（zero initial）：被初始化为0，bss段本质上也是属于数据段。也就是说bss段就是被初始化为0的数据段
+>
+> 本质上来说.data和bss都是用来存放C程序中的全局变量的。区别在于把显式初始化为非零的全局变量存放在.data段中，把显式初始化为0或没有显式初始化的全局变量存放在bss段中。（这也就是为什么C语言中未显式初始化的全局变量的值为默认为0）
+
+
+
+1. 从KERNBASE开始想起。回顾Lab 1我们知道，内存0xf0000-0x100000是BIOS映射区，在这之前又是ROM映射区，这段空间不能使用，不能被分配器分配出去。在文件inc/memlayout.h中，宏IOPHYSMEM（0xa0000）定义了这段IO段内存的开头
 2. 在IOPHYSMEM之前还有一些内存没有分配，这部分内存是可以使用的。函数i386_detect_memory得到的npages_basemem就是这一段的长度，初始化page分配器时应该包含这一段。可以验证一下，npages_basemem的值为160，总的page大小为160 * 4096 = 655360 = 0xa0000，确实是IOPHYSMEM
 3. 从0x100000开始以上的内存就是内核，可以回顾Lab 1中探索内核结构的结果，内核的.text区的虚拟地址为0xf0100000，物理地址正是0x100000。文件inc/memlayout.h中定义的宏EXTPHYSMEM就是0x100000，意思是BIOS以上的内存，称为拓展区，其上限由RAM硬件大小决定
 
@@ -666,28 +676,29 @@ pages ends 0x158000 -->+------------------------------+
 void
 page_init(void)
 {
-	// 1）物理页第0页为已使用
-	// 	 这样我们就可以保留实模式下的 IDT 和 BIOS 结构。
-	// 	 以防万一我们需要它们。 (目前我们不需要，但是...)
-	pages[0].pp_ref = 0;
-    pages[0].pp_link = NULL;
-    page_free_list = &pages[0];
-	// 2) 剩下的基本内存，[PGSIZE, npages_basemem * PGSIZE)是空闲的
-	size_t i = 1;
-	for (; i < npages_basemem; i++) {
-		pages[i].pp_ref = 0; // 使用该页的数量初始化时都设为0 Don't mark reference count!
-		pages[i].pp_link = page_free_list; // 连接上一个空闲页 connect the previous page
-		page_free_list = &pages[i]; // 更新最新的空闲页为此页
-	}
-	// 3) 然后是IO专门分配空间[IOPHYSMEM, EXTPHYSMEM)，它肯定是无法被分配的。
-	// 4) 然后是扩展内存 [EXTPHYSMEM, ...)。
-	//	有些在使用中，有些是空闲的。内核位于物理内存中的哪个地方, 哪些页已经被使用于页表和其他数据结构？
-	// 分配给内核的内存之后的内存，也可以使用 extended pages after kernel
-	i = PADDR(boot_alloc(0)) / PGSIZE; // 确定内核内存段之后的可分配的页的索引
-	for (; i < npages; ++i) {
-        pages[i].pp_ref = 0;
-        pages[i].pp_link = page_free_list;
-        page_free_list = &pages[i];
+	int num_alloc = ((uint32_t)boot_alloc(0) - KERNBASE) / PGSIZE; //前面有调用boot_alloc函数分配的内存
+	int num_iohole = (EXTPHYSMEM - IOPHYSMEM) / PGSIZE;
+	size_t i;
+	for (i = 0; i < npages; i++) {
+		// 1）物理页第0页为已使用
+		// 	 这样我们就可以保留实模式下的 IDT 和 BIOS 结构。
+		// 	 以防万一我们需要它们。 (目前我们不需要，但是...)
+		if (i == 0){
+			pages[i].pp_ref = 1;
+		}
+		// 2) 然后是IO专门分配空间[IOPHYSMEM, EXTPHYSMEM)，它肯定是无法被分配的。
+		else if(i >= npages_basemem && i < npages_basemem + num_iohole + num_alloc){
+        	pages[i].pp_ref = 1;
+		}
+		// 3) 剩下的基本内存，[PGSIZE, npages_basemem * PGSIZE)是空闲的
+		// 4) 然后是扩展内存 [EXTPHYSMEM, ...)。
+		//	有些在使用中，有些是空闲的。内核位于物理内存中的哪个地方, 哪些页已经被使用于页表和其他数据结构？
+		// 分配给内核的内存之后的内存，也可以使用 extended pages after kernel
+		else{
+			pages[i].pp_ref = 0; // 使用该页的数量初始化时都设为0
+			pages[i].pp_link = page_free_list; // 连接上一个空闲页
+			page_free_list = &pages[i]; // 更新最新的空闲页为此页,制造链式结构
+		}
 	}
 }
 ```
@@ -1154,4 +1165,26 @@ mem_init(void)
 #define KSTACKTOP	KERNBASE  // 内核栈
 #define KSTKSIZE	(8*PGSIZE)  // 内核栈空间 32KB
 #define UPAGES		(UVPT - PTSIZE) // 页面结构的只读副本
+```
+
+最终，测试通过如下
+
+![](fig/2024-01-07-22-24-28.png)
+
+##### Question
+我们已将内核和用户环境放在同一地址空间中。 为什么用户程序无法读取或写入内核的内存？ 哪些特定机制保护内核内存？
+
+A：页表项中有读写保护位，以及PTE_U区分内核和用户，MMU应该会实现这种保护。
+
+此操作系统可以支持的最大物理内存量是多少？ 为什么？
+
+A：4GB，因为32位地址线，可以寻址4GB大小。
+
+如果我们实际拥有最大的物理内存量，那么管理内存的空间开销是多少？ 这个开销是如何分解的？
+
+A：4GB/PASIZE = $2^{32}/2^{12}$ = $2^{20}$页，每个页表项4B
+```
+页表占用内存2^20x4B = 4M，
+page directory = 4K,
+Pages结构体2^20*(4+2) = 6M
 ```
