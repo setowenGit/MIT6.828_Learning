@@ -14,6 +14,8 @@
 
 ##### [Github参考3](https://github.com/yunwei37/6.828-2018-labs?tab=readme-ov-file)
 
+##### [lecture的翻译笔记](https://zhuzilin.github.io/blog/tags/6-828/)
+
 ##### [实验环境配置(其他报错问题可看评论区)](https://blog.csdn.net/Rcary/article/details/125547980?utm_source=app&app_version=4.17.0)
 
 ---
@@ -1188,3 +1190,153 @@ A：4GB/PASIZE = $2^{32}/2^{12}$ = $2^{20}$页，每个页表项4B
 page directory = 4K,
 Pages结构体2^20*(4+2) = 6M
 ```
+
+## Lecture 5
+
+[看这个笔记](https://zhuzilin.github.io/blog/6.828-note4-isolation-mechanisms/)
+
+隔离：其实就是用户态到内核态的切换，其中的trap（陷阱）其实就是用户调用的INT指令，也就是软件中断
+
+##### 陷阱，中断，异常
+
+* 陷阱（Trap）：是由程序有意触发的，用来请求操作系统或者内核的服务。例如，当一个程序需要向操作系统请求资源或服务时，可以通过陷阱将控制权交给操作系统。
+* 中断（Interrupt）：是由硬件或者其他外部事件触发的，用来打断正在执行的程序，然后跳转到相应的中断服务程序来处理这个事件。例如，硬件设备可以通过中断请求来通知 CPU 需要进行数据传输或者其他处理。
+* 异常（Exception）：是由程序运行时产生的一种信号，表示发生了一些意外情况，比如除零、非法指令等。操作系统会根据异常的类型来采取相应的处理方式，可能会终止程序的执行或者进行错误处理。
+
+总的来说，陷阱是由程序主动触发的，中断是由外部事件触发的，而异常则是由程序执行过程中出现的问题引起的。操作系统需要对这三种情况做出适当的响应和处理。
+
+## HW 3: xv6 system calls
+
+注意使用的是xv6，而不是JOS系统
+
+#### Part 1：System call tracing
+
+修改xv6内核，以便为每个系统调用调用打印出一行，打印系统调用的名称和返回值
+
+在syscall.c函数中，改动如下
+
+```c++
+static char *syscall_name[] = {
+[SYS_fork]    "fork",
+[SYS_exit]    "exit",
+[SYS_wait]    "wait",
+[SYS_pipe]    "pipe",
+[SYS_read]    "read",
+[SYS_kill]    "kill",
+[SYS_exec]    "exec",
+[SYS_fstat]   "fstat",
+[SYS_chdir]   "chdir",
+[SYS_dup]     "dup",
+[SYS_getpid]  "getpid",
+[SYS_sbrk]    "sbrk",
+[SYS_sleep]   "sleep",
+[SYS_uptime]  "uptime",
+[SYS_open]    "open",
+[SYS_write]   "write",
+[SYS_mknod]   "mknod",
+[SYS_unlink]  "unlink",
+[SYS_link]    "link",
+[SYS_mkdir]   "mkdir",
+[SYS_close]   "close",
+[SYS_date]	  "date",
+[SYS_alarm]   "alarm",
+};
+
+void
+syscall(void)
+{
+  int num;
+  // 关中断读取进程信息
+  // xv6通常需要有指向当前进程的proc结构体的指针,函数myproc返回当前CPU上运行进程struct proc的指针
+  struct proc *curproc = myproc(); 
+  //num 取值应该[1-最大的系统调用序号]
+  num = curproc->tf->eax;
+  // 检查系统调用是否存在
+  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+     curproc->tf->eax = syscalls[num]();  //存储系统调用返回值
+	   cprintf("%s: -> %d\n",syscall_name[num], curproc->tf->eax);
+  } else {
+    cprintf("%d %s: unknown sys call %d\n",
+            curproc->pid, curproc->name, num);
+    curproc->tf->eax = -1;
+  }
+}
+```
+
+终端运行```make qemu-nox```，效果如下
+
+![](fig/2024-03-10-23-01-09.png)
+
+#### Part 2：Date system call
+
+向xv6添加一个新的系统调用。该练习的主要要点是让您看到系统调用机器的一些不同部分。您的新系统调用将获得当前的UTC时间，并将其返回给用户程序。
+
+参考：https://www.cnblogs.com/zsmumu/p/12622898.html 和 https://blog.csdn.net/a747979985/article/details/96118253
+
+* 在Makefile文件的UPROGS中添加 _date，即添加声明shell的date命令
+* 新建文件 date.c 和 date.h
+
+```c++
+// date.h
+struct rtcdate {
+  uint second;
+  uint minute;
+  uint hour;
+  uint day;
+  uint month;
+  uint year;
+};
+
+// data.c
+#include "types.h"
+#include "user.h"
+#include "date.h"
+int
+main(int argc, char *argv[])
+{
+	struct rtcdate r;
+	if (date(&r)) {
+		printf(2, "date failed\n");
+		exit();
+	}
+	// 打印时间
+	printf(1, "%d-%d-%d %d:%d\n",r.year, r.month, r.day, r.hour, r.minute);
+	exit();
+}
+```
+
+* 文件user.h中添加 ```int date(struct rtcdate*);```，即声明date函数
+* 文件usys.S中添加 ```SYSCALL(date)```，即声明date关联到了系统调用sys_date
+* 文件syscall.h中添加 ```#define SYS_date   22```，即定义该系统调用的调用号
+* 文件syscall.c中添加，即实现了该系统调用
+
+```c++
+int sys_date(void) {
+    struct rtcdate* r = 0;
+    if (argptr(0, (char**)&r, sizeof(*r) < 0)) {
+        return -1;
+    }
+    cmostime(r); // 获取当前时间
+    return 0;
+}
+```
+
+注意，要注释掉上个part的打印，才能够正常启动xv6的shell
+
+![](fig/2024-03-10-23-32-06.png)
+
+##### 运行逻辑
+
+```
+date.c/main()-->date.c/date(&r)-->tarpasm.S/alltrap-->trap.c/syscall()-->syscall.c/sys_date()-->syscall.c/sys_date():comstime()-->tarpasm.S/trapret-->main()
+```
+
+* 命令行输入```$ date```，找到对应的date.c文件，从main函数开始执行，执行到date(&r)，发现是个系统调用，然后准备陷入trap
+* 在执行陷入指令的时候首先会到trapasm.S中的alltraps中，将trapframe存入到应用程序的内核栈中(保护现场)
+* 将esp的地址存入栈中作为trap函数的输入，然后调用trap
+* 在trap.c/trap()中调用syscall()，从%eax中获取系统调用号为SYS_date，开始执行系统调用sys_date()
+* 在sys_date()中将参数r赋值，然后系统调用结束，恢复main函数现场，输出r即可
+
+##### sys_date 与 date(&r)怎么联系起来的？
+
+Makefile中的UPROGS是一个变量，make fs.img的时候需要mkfs README以及UPROGS所代表的文件。由于usys.S中有SYSCALL(date)，所以认为date()函数是个系统调用，所以当使用date(&r)时就会陷入(中断、异常、系统调用都会陷入)，调用trap(tf)函数，函数中又调用syscall()，根据tf->eax找到对应的系统调用号，调用sys_date()。
