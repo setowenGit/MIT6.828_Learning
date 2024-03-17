@@ -766,6 +766,8 @@ x86建立了两次映射，程序给出地址，经过这两次翻译之后，�
 * Page Translation将线性地址转化为物理地址，也就是真正用来索引内存的物理地址
 * 在本项目中，还没有做Segment Translation映射虚拟地址的处理，所以线性地址和虚拟地址相同
 
+![](fig/2024-03-17-22-54-12.png)
+
 ##### Segment Translation
 
 Segment Translation的过程可以如下图表示，由一个事先指定的selector选择器，从一个描述符表descriptor table中读出一个描述符descriptor。由这个描述符读出一个基地址base address，虚拟地址作为一种偏置offset，加到基地址上，就得到了linear address
