@@ -94,15 +94,16 @@ default:
     /*new add*/
     // char *mem;
     // uint a;
-    a = PGROUNDDOWN(rcr2()); // 使用PGROUNDDOWN（va）将有问题的虚拟地址向下舍入到页面边界
-    for(;a<myproc()->sz;a+=PGSIZE){
-      mem = kalloc();
-      if(mem==0){
+    a = PGROUNDDOWN(rcr2()); // 使用PGROUNDDOWN(va)将有问题的虚拟地址向下舍入到页面边界，得到起始虚拟地址
+    for(;a<myproc()->sz;a+=PGSIZE){ // 循环遍历从起始虚拟地址开始到进程的大小（myproc()->sz）结束，每次增加一个页面大小
+      mem = kalloc(); // 分配物理内存页面
+      if(mem==0){ // 如果分配失败，打印错误信息并释放之前已经分配的内存，然后返回
        cprintf("allocuvm out of memory\n");
        deallocuvm(myproc()->pgdir,myproc()->sz,myproc()->tf->eax);
        return ;
       }
-      memset(mem,0,PGSIZE);
+      memset(mem,0,PGSIZE); // 使用memset函数将分配的物理内存清零，确保数据的干净状态
+      // 调用mappages函数将虚拟地址映射到物理地址，并设置相应的页表项（PTE）。如果映射失败，打印错误信息，释放内存，然后返回
       if(mappages(myproc()->pgdir,(char *)a, PGSIZE, V2P(mem), PTE_W|PTE_U)<0){
         cprintf("alloccuvm out of memory(2)\n");
         deallocuvm(myproc()->pgdir,myproc()->sz,myproc()->tf->eax);
