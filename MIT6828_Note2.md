@@ -16,6 +16,7 @@
 
 ##### [lecture的翻译笔记](https://zhuzilin.github.io/blog/tags/6-828/)
 
+##### [CSDN参考](https://blog.csdn.net/qq_43012789?type=blog)
 ##### [实验环境配置(其他报错问题可看评论区)](https://blog.csdn.net/Rcary/article/details/125547980?utm_source=app&app_version=4.17.0)
 
 ---
@@ -122,3 +123,143 @@ default:
     myproc()->killed = 1;
   
 ```
+
+## Lecture 7
+
+[看这个笔记](https://zhuzilin.github.io/blog/6.828-note6-using-virtual-memory/)
+
+xv6和JOS都是OS设计的例子，但是他们和真正的OS相比还是有很大差距的，以下就是其中一些真正OS的优化
+
+* guard page to protect against stack overflow：user stack后面放一个没有被map的page，这样如果stack overflow了，会得到page fault，当application跑到guard page上来的时候分配more stack
+* one zero-filled page：观察到很多时候一些memory从来不会被写入，而因为所有的内存都会用0进行初始化，所以可以使用一个zeroed page for all zero mappings。当需要zero-filled page的时候，就map到这个zeroed page，在写入的时候，先拷贝这个公共的zeroed-filled page给另一个内存空间，然后再对这个新的内存空间进行写操作，与父子进程一开始fork后共享内存空间相似
+* copy-on-write fork：很多时候都是fork之后马上exec，如果赋值了会很浪费，所以把parent和child的内存先共享着，并且把child的内存设置为copy on write，也就是有写入的时候再复制
+* demanding paging：现在的exec可能会把整个文件都加载到内存中，这样会很慢，并且有可能没必要。可以先分配page，并标记为on demand，on default从file中读取对应的page
+* 用比物理内存更大的虚拟内存：有的时候可能需要比物理内存还大的内存。解决方法就是把内存中不常用的部分存在硬盘上。在硬盘和内存之间 page in and out数据
+  * 使用PTE来检测什么时候需要disk access
+  * 用page table来找到least recent used disk block 并把其写回硬盘（LRU）
+* memory-mapped files：通过load, store而不是read, write, lseek来access files以轻松访问文件的某一部分，用memory offset而不是seeking
+##### The UVPD (User Virtual Page Directory)
+
+下图和下面的代码很好的演示了如何能够找到一个虚拟地址
+
+![](fig/2024-05-06-19-37-01.png)
+
+```
+page directory = pd = lcr3();
+page table = pt = *(pd + 4*PDX);
+page = *(pt + 4*PTX);
+```
+
+但是这种方式我们该如何用VA来访问PD或者某一个page table呢？或者说PD和PT也应该有自己的映射才对
+
+采用的方法是通过让PD自己指向自己，也就是两步都是指向自己的开头，在JOS中V是0x3BD（V是page directory的一个索引，里面存放的指针指向的是page directory自己）。UVPD（应该就是page directory）是 (0x3BD<<22)|(0x3BD<<12)，然后如下图：
+
+![](fig/2024-05-06-19-40-45.png)
+
+这样如果PDX和PTX都是V，两次之后还是会指向PD，如果PDX=V但是PTX!=V，那么运行之后就会指向某一个page table。通过以上的方式，我们就把虚拟地址映射到了PD和PT了。
+
+## HW 5: xv6 CPU alarm
+
+在本练习中，将在xv6中添加一项功能，当进程使用CPU时间时，它会定期向进程发出警报。这对于希望限制占用多少CPU时间的受计算限制的进程，或者希望进行计算但又希望采取一些周期性操作的进程可能很有用。更一般地说，您将实现用户级中断/故障处理程序的原始形式；例如，您可以使用类似的东西来处理应用程序中的页面错误。
+
+需要添加一个新的alarm(interval, handler)系统调用。如果一个应用程序调用了alarm(n,fn), 那么在程序消耗每个n“ticks”的CPU时间之后，内核将调用应用程序函数fn。 当fn返回时，应用程序将从中断处继续。 tick是xv6中相当随意的时间单位，由硬件定时器产生中断的频率决定。
+
+把下述样例程序放到文件alarmtest.c中。该程序调用alarm(10，periodic)，要求内核每10秒钟强制调用periodic()，然后旋转一会儿
+
+* 新增alarmtest.c文件
+
+```c++
+#include "types.h"
+#include "stat.h"
+#include "user.h"
+
+void periodic();
+
+int
+main(int argc, char *argv[])
+{
+  int i;
+  printf(1, "alarmtest starting\n");
+  alarm(10, periodic);
+  for(i = 0; i < 25*5000000; i++){
+    if((i % 250000) == 0)
+      write(2, ".", 1);
+  }
+  exit();
+}
+
+void
+periodic()
+{
+  printf(1, "alarm!\n");
+}
+```
+
+* 参考HW3,添加系统调用
+  * syscall.c: extern int sys_alarm(void);
+  * syscall.c: [SYS_alarm]   sys_alarm,
+  * syscall.h: #define SYS_alarm  24
+  * user.h:    int alarm(int, void (*)());
+  * usys.S:    SYSCALL(alarm)
+
+* sysproc.c添加函数
+
+```c++
+int
+sys_alarm(void) 
+{
+	// 间隔 
+	int interval;
+	// 函数指针
+	void (*handler)(void);
+	
+	if(argint(0, &interval) < 0)
+		return -1;
+	if(argptr(1, (char **)&handler, 1) < 0)
+		return -1;
+
+	myproc()->alarminterval = interval;
+	myproc()->alarmhandler = handler;
+	return 0;
+}
+```
+
+* proc.h结构体中增加成员
+
+```c++
+int alarminterval;              
+void (*alarmhandler)();
+int ticks;
+```
+
+* trap.c中的trap函数增加情况
+
+```c++
+case T_IRQ0 + IRQ_TIMER:
+    if(cpuid() == 0){
+      acquire(&tickslock);
+      ticks++;
+	  
+      wakeup(&ticks);
+      release(&tickslock);
+    }
+    /*new add*/
+  	if(myproc() != 0 && (tf->cs & 3) == 3){
+  		myproc()->ticks++;
+  		// 没有alarm任务的proc, 不会进入以下if,因为alarminterval为0
+  		if(myproc()->ticks == myproc()->alarminterval) {
+  			myproc()->ticks = 0;
+  			tf->esp -= 4;
+  			// eip压栈
+  			*(uint *)(tf->esp) = tf->eip;
+  			tf->eip = (uint)myproc()->alarmhandler; // 执行alarm系统调用
+  	  	}
+  	}
+    lapiceoi();
+    break;
+```
+
+运行效果如下
+
+![](fig/2024-05-06-20-25-41.png)
+
