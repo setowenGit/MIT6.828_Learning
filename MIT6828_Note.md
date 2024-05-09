@@ -1113,7 +1113,7 @@ mem_init(void)
 	// -在 UPAGES 处的新映像 -- 内核R，用户R(即 perm = PTE_U | PTE_P)
 	// -页面本身 -内核RW，用户NONE
 	// Your code goes here:
-	boot_map_region(kern_pgdir, UPAGES, npages * sizeof(struct PageInfo), PADDR(pages), PTE_U);
+	boot_map_region(kern_pgdir, UPAGES, ROUNDUP((npages * sizeof(struct PageInfo)), PGSIZE), PADDR(pages), PTE_U);
 
 	// 使用'bootstack'所指的物理内存地址作为内核栈。 
 	// 内核堆栈从虚拟地址 KSTACKTOP 向下扩展。

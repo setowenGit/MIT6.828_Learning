@@ -263,3 +263,161 @@ case T_IRQ0 + IRQ_TIMER:
 
 ![](fig/2024-05-06-20-25-41.png)
 
+## Lab 3: User Environments
+
+lab3 比 lab2 多了以下文件
+
+![](fig/2024-05-07-20-04-57.png)
+
+在这个lab中，进程就是环境，环境就是进程
+### Part A: User Environments and Exception Handling
+
+在kern/env.c中，内核维护了与环境有关的三个主要全局变量：
+
+```c++
+#define LOG2NENV		10
+#define NENV			(1 << LOG2NENV)  // 最大进程数量
+
+struct Env *envs = NULL;		    // All environments 所有进程
+struct Env *curenv = NULL;		    // The current env  现在运行的进程
+static struct Env *env_free_list;	// Free environment list  空闲的进程
+```
+
+* 一旦JOS启动并运行，envs指针将指向Env代表系统中所有环境的结构数组。JOS内核将最多支持 NENV 个活动环境
+* JOS内核将所有非活动Env结构保留在env_free_list上。这种设计可以轻松分配和释放环境，因为只需将它们添加到空闲列表中或从空闲列表中删除
+* 内核使用该curenv符号在任何给定时间跟踪当前正在执行的环境。在启动期间，在运行第一个环境之前， curenv初始设置为NULL
+
+在inc/env.h中，定义了结构体Env
+
+```c++
+enum {
+	ENV_FREE = 0, // 空闲状态，此时进程位于env_free_list中
+	ENV_DYING,    // 挂死进程，之后就会被释放
+	ENV_RUNNABLE, // 就绪状态
+	ENV_RUNNING,  // 正在运行状态
+	ENV_NOT_RUNNABLE // 阻塞状态，如该进程正在等待某个信号量
+};
+
+enum EnvType {
+	ENV_TYPE_USER = 0,
+};
+
+struct Env {
+	struct Trapframe env_tf;	// Saved registers  保存进程的寄存器现场值
+	struct Env *env_link;		// Next free Env    指向env_free_list中下一个空闲的进程
+	envid_t env_id;			    // Unique environment identifier  独一无二的进程ID
+	envid_t env_parent_id;		// env_id of this env's parent    该进程的父进程，该进程就是由父进程fork出来的
+	enum EnvType env_type;		// Indicates special system environments  进程类型
+	unsigned env_status;		// Status of the environment  进程状态
+	uint32_t env_runs;		    // Number of times environment has run
+	// Address space
+	pde_t *env_pgdir;		// Kernel virtual address of page dir 保存此进程的page directory的内核虚拟地址
+};
+```
+
+* 要运行进程，内核必须使用该进程保存的寄存器和对应的地址空间设置CPU
+* 在JOS中，单个环境不像xv6中的进程那样有自己的内核堆栈。内核中一次只能有一个活动的JOS环境，因此JOS只需要一个内核堆栈。
+
+##### exercise 1
+
+在Lab 2中，您在mem_init()中为pages[]数组分配了内存，这是一个内核用来跟踪哪些页面是空闲的，哪些不是空闲的表。您现在需要进一步修改mem_init()，以分配一个类似的Env结构数组，称为envs
+
+修改kern/pmap.c中的mem_init()，以分配和映射envs数组。这个数组完全由分配的Env结构的NENV个实例组成，就像您分配pages数组的方式一样。和pages数组一样，内存支持envs也应该在UENVS（在inc/memlayout.h中定义）上映射用户只读，这样用户进程就可以从这个数组中读取
+
+```c++
+envs = (struct Env*)boot_alloc(sizeof(struct Env)*NENV);
+memset(envs, 0, sizeof(struct Env)*NENV);
+
+boot_map_region(kern_pgdir, UENVS, ROUNDUP((NENV * sizeof(struct Env)), PGSIZE), PADDR(envs), PTE_U);
+```
+
+##### exercise 2
+
+现在需要在kern/env.c文件中写代码来运行用户环境。因为暂时还没有一个文件系统，所以将设置内核来加载一个静态二进制映像，它嵌入在内核本身中。JOS将这个二进制文件作为ELF可执行映像嵌入到内核中。
+
+在kern/init.c文件中的i386_init函数中，将会看到在环境中运行其中一个二进制映像的代码。然而，设置用户环境的关键代码还不完整，需要去完成以下函数
+
+* env_init()：初始化envs数组中的所有Env结构，并将它们添加到env_free_list中。还调用env_init_percpu，它使用特权级别0（内核）和特权级别3（用户）的单独段来配置分割硬件
+* env_setup_vm()：为新环境分配一个页面目录，并初始化新环境的地址空间的内核部分
+* region_alloc()：为环境分配和映射物理内存
+* load_icode()：您将需要解析一个ELF二进制映像，就像boot loader已经做的那样，并将其内容加载到新环境的用户地址空间中
+* env_create()：使用env_alloc分配一个环境，并调用load_icode来将一个ELF二进制文件加载到其中
+* env_run()：启动以用户模式运行的给定环境
+
+下面是代码的调用图，直到调用用户代码为止，可供参考：
+
+* start (kern/entry.S)：kernel的entry，也就是boot loader加载kernel的entry
+* i386_init (kern/init.c)：上面的entry调用了这个函数，对kernel进行初始化
+  * cons_init：初始化console
+  * mem_init：初始化kernel address space
+  * env_init：初始化所有的环境
+  * trap_init (still incomplete at this point)：初始化中断
+  * env_create：创建一个用户环境
+  * env_run：运行用户环境
+    * env_pop_tf：从trapframe中还原这个用户环境所需要的寄存器状态
+
+如果一切顺利，您的系统应该进入用户空间并执行hello二进制文件，直到它使用int指令进行系统调用
+
+因为并没有初始化中断，所以会在user_hello第一次进行system call的时候报triple fault的错。这是因为：当CPU发现它没有设置来处理这个系统调用中断，它将生成一个一般保护异常，发现它不能处理，生成一个双故障异常，发现它不能处理，最后放弃所谓的“三重故障”
+
+**env_init**：确保所有的环境envs是空闲的状态,并初始化它们的 id 为 0,接着将它们插入到 env_free_list当中,确保环境在free list中的顺序与它们在envs数组中的顺序相同（即:使第一个调用的 env_alloc()返回envs[0]）
+```c++
+void
+env_init(void)
+{
+	// Set up envs array
+	// LAB 3: Your code here.
+	env_free_list = NULL;
+  for (int i = NENV - 1; i >= 0; --i) {
+      envs[i].env_id = 0;
+      envs[i].env_status = ENV_FREE;
+      envs[i].env_link = env_free_list;
+      env_free_list = &envs[i];
+  }
+	// Per-CPU part of the initialization
+	env_init_percpu();
+}
+```
+
+**env_setup_vm**: 直接把内核的页表目录拿过来用就行，且为Page Directory分配的新page应该增加引用统计次数pp_ref，UTOP以上的地址对用户应该为可读可写的，唯独UVPT是只可读
+
+```c++
+static int
+env_setup_vm(struct Env *e)
+{
+	int i;
+	struct PageInfo *p = NULL;
+
+	// Allocate a page for the page directory
+	if (!(p = page_alloc(ALLOC_ZERO)))
+		return -E_NO_MEM;
+
+	// LAB 3: Your code here.
+	e->env_pgdir = (pde_t *) page2kva(p);
+    //复制内核页目录, 因为在UTOP之上与kern_pgdir是一样的，所以可以直接把kern_pgdir的内容全部拷贝过来
+    memcpy((void *) e->env_pgdir, kern_pgdir, PGSIZE); 
+    p->pp_ref++;
+
+    // UTOP以下都是可读可写的
+    for (pde_t *pde = e->env_pgdir; pde < (pde_t*)((uintptr_t)e->env_pgdir + PGSIZE); ++pde) {
+        *pde |= PTE_U | PTE_W;
+    }
+
+	// 但是唯独UVPT这个地方是不一样的，因为要放的是自己的页表目录，所以只可读
+	e->env_pgdir[PDX(UVPT)] = PADDR(e->env_pgdir) | PTE_P | PTE_U;
+
+	return 0;
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
