@@ -302,6 +302,25 @@ enum EnvType {
 	ENV_TYPE_USER = 0,
 };
 
+struct Trapframe {
+	struct PushRegs tf_regs;
+	uint16_t tf_es;
+	uint16_t tf_padding1;
+	uint16_t tf_ds;
+	uint16_t tf_padding2;
+	uint32_t tf_trapno;
+	/* below here defined by x86 hardware */
+	uint32_t tf_err;
+	uintptr_t tf_eip;
+	uint16_t tf_cs;
+	uint16_t tf_padding3;
+	uint32_t tf_eflags;
+	/* below here only when crossing rings, such as from user to kernel */
+	uintptr_t tf_esp;
+	uint16_t tf_ss;
+	uint16_t tf_padding4;
+} __attribute__((packed));
+
 struct Env {
 	struct Trapframe env_tf;	// Saved registers  保存进程的寄存器现场值
 	struct Env *env_link;		// Next free Env    指向env_free_list中下一个空闲的进程
@@ -333,7 +352,7 @@ boot_map_region(kern_pgdir, UENVS, ROUNDUP((NENV * sizeof(struct Env)), PGSIZE),
 
 ##### exercise 2
 
-现在需要在kern/env.c文件中写代码来运行用户环境。因为暂时还没有一个文件系统，所以将设置内核来加载一个静态二进制映像，它嵌入在内核本身中。JOS将这个二进制文件作为ELF可执行映像嵌入到内核中。
+现在需要在kern/env.c文件中写代码来运行用户环境。因为操作系统暂时还没有实现文件系统，所以将设置内核来加载一个静态二进制映像，它嵌入在内核本身中，每个二进制映像（也就是elf文件）被加载到不同的环境中
 
 在kern/init.c文件中的i386_init函数中，将会看到在环境中运行其中一个二进制映像的代码。然而，设置用户环境的关键代码还不完整，需要去完成以下函数
 
@@ -357,8 +376,6 @@ boot_map_region(kern_pgdir, UENVS, ROUNDUP((NENV * sizeof(struct Env)), PGSIZE),
     * env_pop_tf：从trapframe中还原这个用户环境所需要的寄存器状态
 
 如果一切顺利，您的系统应该进入用户空间并执行hello二进制文件，直到它使用int指令进行系统调用
-
-因为并没有初始化中断，所以会在user_hello第一次进行system call的时候报triple fault的错。这是因为：当CPU发现它没有设置来处理这个系统调用中断，它将生成一个一般保护异常，发现它不能处理，生成一个双故障异常，发现它不能处理，最后放弃所谓的“三重故障”
 
 **env_init**：确保所有的环境envs是空闲的状态,并初始化它们的 id 为 0,接着将它们插入到 env_free_list当中,确保环境在free list中的顺序与它们在envs数组中的顺序相同（即:使第一个调用的 env_alloc()返回envs[0]）
 ```c++
@@ -398,26 +415,331 @@ env_setup_vm(struct Env *e)
     memcpy((void *) e->env_pgdir, kern_pgdir, PGSIZE); 
     p->pp_ref++;
 
-    // UTOP以下都是可读可写的
-    for (pde_t *pde = e->env_pgdir; pde < (pde_t*)((uintptr_t)e->env_pgdir + PGSIZE); ++pde) {
-        *pde |= PTE_U | PTE_W;
-    }
-
-	// 但是唯独UVPT这个地方是不一样的，因为要放的是自己的页表目录，所以只可读
+	// 唯独UVPT这个地方是不一样的，因为要放的是自己的页表目录，所以只可读
 	e->env_pgdir[PDX(UVPT)] = PADDR(e->env_pgdir) | PTE_P | PTE_U;
 
 	return 0;
 }
-
 ```
 
+**region_alloc**: 为env环境分配 len个字节物理地址内存, 并且将此物理地址映射到环境地址空间的虚拟地址va上，一个给 load_icode() 用的辅助函数，这里和 lab2 的函数原理类似
 
+```c++
+static void
+region_alloc(struct Env *e, void *va, size_t len)
+{
+	// LAB 3: Your code here.
+	// (But only if you need it for load_icode.)
+	void *begin = (void *) ROUNDDOWN((uint32_t) va, PGSIZE), *end = (void *) ROUNDUP((uint32_t) va + len, PGSIZE);
+    struct PageInfo *p = NULL;
+    for (void *curVa = begin; curVa < end; curVa += PGSIZE) {
+        p = page_alloc(ALLOC_ZERO);
+		if(!p) {
+          panic("region alloc error! error:%e", -E_NO_MEM);
+        }
+        if (page_insert(e->env_pgdir, p, curVa, PTE_U | PTE_W)) {
+            panic("region alloc error! error:%e", -E_NO_MEM);
+        }
+    }
+}
+```
 
+**load_icode**：首先需要了解ELF，Proghdr和Secthdr这三个与elf文件有关的结构体
 
+![](fig/2024-05-09-18-22-01.png)
 
+```c++
+// elf文件整体结构体
+struct Elf {
+	uint32_t e_magic;	 // ELF 文件的标识符，必须等于 ELF_MAGIC，用于标识文件是否为 ELF 格式
+	uint8_t  e_elf[12];  // 保留的 12 字节，通常不使用
+	uint16_t e_type;     // 描述 ELF 文件的类型，比如可执行文件、共享目标文件等
+	uint16_t e_machine;  // 描述目标体系结构的标识符，指示了文件运行的平台
+	uint32_t e_version;  // ELF 文件的版本号
+	uint32_t e_entry;    // 程序的入口点（即程序启动时执行的第一条指令的地址）
+	uint32_t e_phoff;    // 程序头表（Program Header Table）在文件中的偏移量，即程序头表的起始位置
+	uint32_t e_shoff;    // 节头表（Section Header Table）在文件中的偏移量，即节头表的起始位置
+	uint32_t e_flags;    // 特定标志的位掩码，用于描述文件的属性
+	uint16_t e_ehsize;   // ELF 头的大小，以字节为单位
+	uint16_t e_phentsize;// 程序头表中每个条目的大小
+	uint16_t e_phnum;    // 程序头表中条目的数量
+	uint16_t e_shentsize;// 节头表中每个条目的大小
+	uint16_t e_shnum;    // 节头表中条目的数量
+	uint16_t e_shstrndx; // 节头表中字符串表节的索引
+};
 
+// 程序头表结构体
+struct Proghdr {
+	uint32_t p_type;     // 段（segment）的类型，描述了段的用途和属性，比如代码段、数据段等
+	uint32_t p_offset;   // 段在文件中的偏移量，即段的起始位置距文件开始的字节偏移量
+	uint32_t p_va;       // 段在内存中的虚拟地址（Virtual Address），即段加载到内存后在虚拟地址空间中的地址
+	uint32_t p_pa;       // 段在内存中的物理地址（Physical Address），即段加载到内存后在物理地址空间中的地址
+	uint32_t p_filesz;   // 段在文件中的大小，以字节为单位
+	uint32_t p_memsz;    // 段在内存中的大小，以字节为单位。通常大于等于 p_filesz，表示在内存中需要分配的空间大小
+	uint32_t p_flags;    // 段的标志位，描述了段的属性，比如可读、可写、可执行等
+	uint32_t p_align;    // 段在文件和内存中的对齐要求，即段在文件中和内存中的起始地址的对齐方式
+};
 
+// 节头表结构体
+struct Secthdr {
+	uint32_t sh_name;    // 节名称在字符串表中的偏移量或索引，用于定位节的名称
+	uint32_t sh_type;    // 节的类型，描述了节的内容和属性，比如代码节、数据节、符号表节等
+	uint32_t sh_flags;   // 节的标志位，描述了节的属性，比如可读、可写、可执行等
+	uint32_t sh_addr;    // 节在内存中的虚拟地址，如果节在内存中被加载，则表示其在内存中的起始地址
+	uint32_t sh_offset;  // 节在文件中的偏移量，即节的起始位置距文件开始的字节偏移量
+	uint32_t sh_size;    // 节在文件中的大小，以字节为单位
+	uint32_t sh_link;    // 与该节相关联的其他节的索引，具体含义取决于节的类型
+	uint32_t sh_info;    // 额外的节信息，具体含义取决于节的类型
+	uint32_t sh_addralign;// 节在文件和内存中的对齐要求，即节在文件中和内存中的起始地址的对齐方式
+	uint32_t sh_entsize; // 如果节包含固定大小的条目，则为每个条目的大小；否则为 0
+};
+```
 
+ELF 文件中的程序头表（Program Header Table）和节头表（Section Header Table）有以下区别：
 
+程序头表（Program Header Table）：
 
+* 用于描述可执行文件或可装载文件在内存中的段（segments）布局
+* 包含了每个段在文件中的偏移量、大小、加载地址等信息
+* 在运行时由操作系统加载，用于映射文件内容到内存
+* 典型的段包括代码段、数据段、动态链接信息段等
 
+节头表（Section Header Table）：
+
+* 用于描述 ELF 文件中的各个节（sections）的布局和属性
+* 每个节包含了特定类型的信息，如代码、数据、符号表、字符串表等
+* 包含了每个节在文件中的偏移量、大小、类型等信息
+* 主要用于链接器（linker）和调试器（debugger）等工具处理 ELF 文件时定位和处理各个节
+
+```c++
+static void
+load_icode(struct Env *e, uint8_t *binary)
+{
+	// LAB 3: Your code here.
+	struct Elf *elf;
+    struct Proghdr *ph, *eph;
+
+    elf = (struct Elf *) binary;
+    ph = (struct Proghdr *) ((uint8_t *) elf + elf->e_phoff); // 取到第一个段
+    eph = ph + elf->e_phnum; // 取到最后一个段之后
+
+    lcr3(PADDR(e->env_pgdir)); //设置当前的页目录寄存器为 当前环境(进程)的页目录物理地址,为什么要这么做？因为下面的memset、memcpy函数默认以页目录寄存器存的值为页目录
+
+    for (; ph < eph; ph++) {
+        if (ph->p_type != ELF_PROG_LOAD) continue;
+        region_alloc(e, (void *) ph->p_va, ph->p_memsz); // 为每个段分配物理内存
+        memset((void *) ph->p_va, 0, ph->p_memsz); // 先全部清零
+        memcpy((void *) ph->p_va, binary + ph->p_offset, ph->p_filesz); // 再把段的内容写到这个内存上
+    }
+    e->env_tf.tf_eip = elf->e_entry; // 配置好用户环境的内核栈,相当于就是首次运行到这个环境之后, e_entry是作为第一个要进入并执行的代码区域.(入口代码具体参考kern/entry.S文件)
+
+    lcr3(PADDR(kern_pgdir));
+	
+	// Now map one page for the program's initial stack
+	// at virtual address USTACKTOP - PGSIZE.
+	// LAB 3: Your code here.
+	region_alloc(e, (void *) (USTACKTOP - PGSIZE), PGSIZE);
+}
+```
+
+**env_create**：先初始化该环境（实际是对新的环境结构体new_e的各个成员的赋值），接着调用load_icode将该环境需要运行的用户进程从elf文件中载入进内存中
+
+```c++
+void
+env_create(uint8_t *binary, enum EnvType type)
+{
+	// LAB 3: Your code here.
+	struct Env *new_e;
+    int r;
+    if ((r = env_alloc(&new_e, 0)) != 0)
+        panic("env_alloc: %e", r);
+    load_icode(new_e, binary);
+    new_e->env_type = type;
+}
+```
+其中的env_alloc对结构体指针new_e所指向的环境的各个成员进行赋值如下
+
+```c++
+e->env_parent_id = parent_id;
+e->env_type = ENV_TYPE_USER;
+e->env_status = ENV_RUNNABLE;
+e->env_runs = 0;
+
+// 为段寄存器设置适当的初始值.
+// GD_UD是GDT中的用户数据段选择器,
+// GD_UT是用户文本段选择器(见inc/memlayout.h).
+// 每个段寄存器的低2位包含请求者权限级别(俗称RPL); 3表示用户模式.
+// 当我们切换权限级别时,硬件会进行各种检查,涉及到RPL和描述符本身所存储的描述符权限级别（俗称DPL）
+#define GD_UT     0x18     // user text
+#define GD_UD     0x20     // user data
+e->env_tf.tf_ds = GD_UD | 3;
+e->env_tf.tf_es = GD_UD | 3;
+e->env_tf.tf_ss = GD_UD | 3;
+e->env_tf.tf_esp = USTACKTOP;
+e->env_tf.tf_cs = GD_UT | 3;
+```
+
+**env_run**：若是进行环境切换（通过curenv是否为NULL来判断是否是环境切换，一开始没有环境运行时curenv是NULL），接着将新环境指针赋给curenv，接着将新环境的状态改为running，旧环境的状态改为runnable，再更新环境运行次数，再将页目录设为新环境的页目录，最后恢复寄存器现场
+
+```c++
+void
+env_run(struct Env *e)
+{
+	// LAB 3: Your code here.
+	if (curenv != NULL && curenv->env_status == ENV_RUNNING)
+        curenv->env_status = ENV_RUNNABLE;
+    curenv = e;
+    curenv->env_status = ENV_RUNNING;
+    curenv->env_runs++;
+    lcr3(PADDR(curenv->env_pgdir));
+
+    cprintf("start env_pop and running...\n"); // 临时加上，为了确认程序是否运行到此处
+
+    env_pop_tf(&curenv->env_tf);
+	// panic("env_run not yet implemented");
+}
+```
+
+其中恢复现场的函数的实现如下
+
+```c++
+void
+env_pop_tf(struct Trapframe *tf)
+{
+	asm volatile(
+		"\tmovl %0,%%esp\n"
+		"\tpopal\n"
+		"\tpopl %%es\n"
+		"\tpopl %%ds\n"
+		"\taddl $0x8,%%esp\n" /* skip tf_trapno and tf_errcode */
+		"\tiret\n"
+		: : "g" (tf) : "memory");
+	panic("iret failed");  /* mostly to placate the compiler */
+}
+```
+
+完成后，运行操作系统，在初始化好env后，会将hello这个elf文件通过env_create函数加载到第一个环境中，该函数被宏包装后放入i386_init中
+
+```c++
+#define ENV_CREATE(x, type)						\
+	do {								\
+		extern uint8_t ENV_PASTE3(_binary_obj_, x, _start)[];	\
+		env_create(ENV_PASTE3(_binary_obj_, x, _start),		\
+			   type);					\
+	} while (0)
+
+#endif // !JOS_KERN_ENV_H
+
+ENV_CREATE(user_hello, ENV_TYPE_USER); // 其中user_hello就是对应了hello的elf文件
+```
+
+运行后显示报错，如图
+
+![](fig/2024-05-09-23-35-05.png)
+
+这是因为现在还没有实现中断，所以会在user_hello第一次进行system call的时候报triple fault的错。这是因为：当CPU发现它没有设置来处理这个系统调用中断，它将生成一个一般保护异常，发现它不能处理，生成一个双故障异常，发现它不能处理，最后放弃所谓的“三重故障”
+
+但是字符串“start env_pop and running...”已经被打印，说明程序已经运行到env_run函数了，接下来就是进入env_pop_tf函数，然后进入中断，但中断现在还没实现，所以接下来就会报错
+
+为了验证只有中断这个已知的问题，进行打断点后单步调试
+
+将断点打在env_pop_tf函数，然后输入c快进到这个断点处，然后不断输入si单步调试，可看到后面开始出现问号 (in ??) ，表示已经出错了
+
+![](fig/2024-05-09-23-48-50.png)
+
+##### exercise 3
+
+阅读[《80386 Programmer's Manual》的第九章](https://pdos.csail.mit.edu/6.828/2018/readings/i386/c09.htm)了解异常和中断
+
+[参考翻译](https://jianzzz.github.io/2017/08/26/%E5%BC%82%E5%B8%B8%E5%92%8C%E4%B8%AD%E6%96%AD/)
+
+中断和异常的区别是，中断interrupts用于处理处理器外部的异步事件，异常exceptions用于处理处理器在执行指令时检测到的情况
+* 外部中断的两个来源：
+  * 可屏蔽中断Maskable interrupts，通过INTR pin来发送信号
+    * 允许中断标志位IF（interrupt-enable flag）控制着是否接受经由INTR pin的外部中断信号。当IF=0，禁止INTR中断；当IF=1，允许INTR中断。处理器接收到RESET信号后，将清除IF和其他标志位
+      * 显式改变IF：CLI(Clear Interrupt-Enable Flag)和STI(Set Interrupt-Enable Flag)显式改变IF
+      * 隐式改变IF：1、指令PUSHF将会在栈上存储所有的标识，包括IF。2、任务切换和指令POPF、IRET将加载标志寄存器，会修改IF。3、中断门interrupt gates自动重置IF，禁止中断  
+  * 不可屏蔽中断Nonmaskable interrupts，通过NMI (Non-Maskable Interrupt) pin来发送信号
+    * 如果正在执行一个不可屏蔽中断的处理程序，处理器将忽略其他来自NMI pin的中断信号，直至执行IRET指令 
+* 异常的两个来源：
+  * 处理器检测。进一步分为故障faults、陷阱traps和中止aborts
+  * 编程。指令INTO、INT 3、INT n、BOUND可以引发异常。这些指令通常被称为“软件中断”，但处理器把它们当作异常处理
+
+异常被分为故障（Faults）、陷阱（Traps）、终止（Aborts）
+* 故障：在指令开始执行之前或在指令执行期间检测到。如果在指令期间检测到故障，则报告故障，机器恢复到允许重新启动指令的状态
+* 陷阱：在检测到异常的指令之后立即在指令边界报告的异常
+* 终止：既不允许获取引起异常的指令的精确位置，也不允许重启导致异常的程序。终止用于报告严重的错误，比如硬件错误和不一致、系统表的非法值
+
+处理器只在一条指令结束及下一条指令开始之际处理异常和中断。在指令边界，处理器通过某些条件和标识设置禁止某些异常和中断
+
+> 指令边界（instruction boundaries）是在编程或计算机系统中，指令或代码段之间的分隔点或边界。这些边界可以表示不同的功能模块、程序段或代码块之间的分隔点。在程序中，指令边界的存在有助于组织和管理代码结构，提高代码的可读性、维护性和可重用性。同时，指令边界也有助于实现代码的模块化和封装，使得代码更易于理解和维护
+
+软件经常需要使用成对的指令来改变堆栈段，比如MOV SS, AX、MOV ESP, StackTop。如果SS已经改变而ESP还未收到相应的改变的时候处理异常或中断，中断或异常处理程序执行期间栈指针SS:ESP是不一致的。为了防止这种情况的发生，80386在执行MOV SS和POP SS指令之后，在下一条指令的指令边界内禁止NMI、INTR、debug exceptions、single-step traps。但是页错误和保护错误仍可能发生，若使用80386 LSS指令，则不会出现这些问题
+
+**异常和中断的优先级**：低优先级的异常被丢弃，低优先级的中断保持等待。在中断处理程序返回控制权的时候，被丢弃的异常将被重新发现
+
+```
+HIGHEST     Faults except debug faults (除了调试故障以外的其他故障)
+  |         Trap instructions INTO, INT n, INT 3
+  |         Debug traps for this instruction
+  |         Debug faults for next instruction
+  |         NMI interrupt
+LOWEST      INTR interrupt
+```
+
+> 调试故障或陷阱是指为了调试和诊断目的而人为引入的故障或陷阱
+> 
+> 在实际应用中，调试陷阱（debug traps）可以通过在代码中插入**调试断点、设置条件断点或者使用特定的调试指令**来实现。当程序执行到设定的调试陷阱位置时，调试器会暂停程序执行，并提供相应的调试信息，使得程序员能够检查程序状态并进行调试
+
+**中断描述符表**
+
+> IDT (Interrupt Descriptor Table)：中断描述符表是用于处理中断和异常的数据结构。在 x86 架构中，IDT 是一个由中断描述符组成的表，每个中断描述符包含了处理特定中断或异常时应该跳转到的处理程序地址
+> 
+> GDT (Global Descriptor Table)：全局描述符表是用于管理内存分段的数据结构。在 x86 架构中，GDT 存储了系统中所有段的描述符，包括代码段、数据段、堆栈段等。每个描述符包含了段的基地址、限制、访问权限等信息
+> 
+> LDT (Local Descriptor Table)：局部描述符表是一种特殊的描述符表，用于存储特定进程或任务的段描述符。每个进程都可以有自己的 LDT，用于管理私有段或与其他进程隔离的段
+
+处理器使用IDTR寄存器来定位IDT表的位置。这个寄存器中含有IDT表32位的基地址和16位的长度（限长）值。IDT表基地址应该对齐在8字节边界上以提高处理器的访问效率。限长值是以字节为单位的IDT表的长度
+
+LIDT和SIDT指令分别用于加载和保存IDTR寄存器的内容
+* LIDT用于创建IDT时的操作系统初始化代码中
+* SIDT用于把IDTR中的基地址和限长内容复制到内存中
+
+![](fig/2024-05-10-21-43-51.png)
+
+IDT可能包括3种描述符：
+* Task gates（用于任务切换）
+* Interrupt gates（用于处理中断请求（IRQ）和异常）
+* Trap gates（用于捕获和处理一些需要在特权级别下运行的异常，如系统调用）
+
+![](fig/2024-05-10-21-45-25.png)
+
+通用寄存器EFLAGS保存的是CPU的执行状态和控制信息，在这里只需要关注两个寄存器：IF和TF
+* TF(Trap Flag)：跟踪标志。置1则开启单步执行调试模式，置0则关闭。在单步执行模式下，处理器在每条指令后产生一个调试异常，这样在每条指令执行后都可以查看执行程序的状态
+* IF(Interrupt enable)：中断许可标志。控制处理器对可屏蔽硬件中断请求的响应。置1则开启可屏蔽硬件中断响应，置0则关闭。IF标志不影响异常和不可屏蔽终端NMI的产生
+
+![](fig/2024-05-10-21-50-54.png)
+
+**中断过程**
+
+中断门或陷阱门间接指向一个处理程序，该程序将在当前执行任务的上下文中被执行。中断门或陷阱门的选择器（selector）指向了GDT或当前LDT的一个可执行段描述符。中断门或陷阱门的偏移部分指向了中断或异常处理程序的起始位置
+
+![](fig/2024-05-10-22-09-11.png)
+
+就像CALL指令导致控制转移一样，中断或异常处理程序的控制转移使用了栈存储了返回原先程序需要的信息。一个中断将在指针指向中断指令之前将EFLAGS进栈，如下图所示。某些异常会导致error code进栈，异常处理函数可以通过error code判断是什么异常
+
+![](fig/2024-05-10-22-12-04.png)
+
+中断程序离开程序的方法也不同于普通程序，它将使用IRET指令离开。通过中断门或陷阱门的中断在当前TF作为EFLAGS的一部分被保存到栈后，将清零TF。通过这个动作处理器可以防止使用单步调试活动影响中断响应。随后IRET指令恢复EFLAGS在栈上的值，也恢复了TF
+* 经由中断门的中断将重置IF，防止其他中断干扰当前的中断处理程序，随后IRET指令恢复EFLAGS在栈上的值
+* 经由陷阱门的中断将不改变IF
+
+任务门间接指向一个任务，任务门的选择器指向GDT的TSS描述符
+
+![](fig/2024-05-10-22-18-31.png)
+
+经由任务门的中断或陷阱的结果是出现一个任务切换。使用一个单独任务来处理中断有两个优点：
+* 整个上下文将被自动保存
+* 通过LDT或页目录给予处理程序单独的地址空间，使其独立于其他任务
+
+当80386操作系统使用中断任务时，实际上有两个调度器：软件调度器(操作系统的一部分)和硬件调度器(处理器的中断机制的一部分)。软件调度器的设计应该考虑一种情况：在启用中断时，硬件调度器随时可能派遣一个中断任务
