@@ -17,6 +17,8 @@
 ##### [lecture的翻译笔记](https://zhuzilin.github.io/blog/tags/6-828/)
 
 ##### [CSDN参考](https://blog.csdn.net/qq_43012789?type=blog)
+
+##### [博客园参考](https://www.cnblogs.com/fatsheep9146/p/5451579.html)
 ##### [实验环境配置(其他报错问题可看评论区)](https://blog.csdn.net/Rcary/article/details/125547980?utm_source=app&app_version=4.17.0)
 
 ---
@@ -851,3 +853,345 @@ INT 3指令导致该陷阱trap，可在一个可执行段将一个操作码替�
 
 ![](fig/2024-05-13-23-00-55.png)
 
+##### exercise 4
+
+让我们看一个实例，假设处理器正在用户状态下运行代码，但是遇到了一个除法指令，并且除数为0
+
+1. 处理器会首先切换自己的堆栈，切换到由TSS的SS0，ESP0字段所指定的内核堆栈区，这两个字段分别存放着GD_KD（全局描述符，用于描述内核数据段）和KSTACKTOP（内核栈的栈顶地址）的值
+2. 处理器把异常参数压入到内核堆栈中，起始于地址KSTACKTOP：
+
+![](fig/2024-06-04-17-37-27.png)
+
+3. 因为我们要处理的是除零异常，它的中断向量是0，处理器会读取IDT表中的0号表项，并且把CS:EIP的值设置为0号中断处理函数的地址值
+4. 中断处理函数开始执行，并且处理中断
+
+对于某些特定的异常，除了上面图中要保存的五个值之外，还要再压入一个字，叫做错误码。比如页表错，就是其中一个实例。当压入错误码之后，内核堆栈的状态如下：
+
+![](fig/2024-06-04-17-38-11.png)
+
+以上几步都是由硬件自动完成的
+
+处理器在用户态下和内核态下都可以处理异常或中断。只有当处理器从用户态切换到内核态时，才会自动地切换堆栈，并且把一些寄存器中的原来的值压入到堆栈上，并且触发相应的中断处理函数。但如果处理器已经由于正在处理中断而处在内核态下时，此时CPU只会向内核堆栈压入更多的值。通过这种方式，内核就可处理嵌套中断
+
+如果处理器已经在内核态下并且遇到嵌套中断，因为它不需要切换堆栈，所以它不需要存储SS，ESP寄存器的值。此时内核堆栈的就像下面这个样子：
+
+![](fig/2024-06-04-17-39-19.png)
+
+这里有一个重要的警告。如果处理器在内核态下接受一个异常，而且由于一些原因，比如堆栈空间不足，不能把当前的状态信息（寄存器的值）压入到内核堆栈中时，那么处理器是无法恢复到原来的状态了，它会自动重启
+
+你现在应该有了所有的基本信息去设置IDT表，并且在JOS处理异常。现在你只需要处理内部异常（中断向量号0~31）
+
+在头文件 inc/trap.h和kern/trap.h 中包含了和中断异常相关的非常重要的定义，你应该好好熟悉一下。kern/trap.h 文件中包含了仅内核可见的一些定义， inc/trap.h 中包含了用户态也可见的一些定义
+
+最后你要实现的代码的效果如下：
+
+![](fig/2024-06-04-17-40-41.png)
+
+每一个中断或异常都有它自己的中断处理函数，分别定义在 trapentry.S中，trap_init()将初始化IDT表。每一个处理函数都应该构建一个结构体 Trapframe 在堆栈上，并且调用trap()函数指向这个结构体，trap()然后处理异常/中断，给他分配一个中断处理函数
+
+所以整个操作系统的中断控制流程为：
+
+1. trap_init() 先将所有中断处理函数的起始地址放到中断向量表IDT中
+2. 当中断发生时，不管是外部中断还是内部中断，处理器捕捉到该中断，进入核心态，根据中断向量去查询中断向量表，找到对应的表项
+3. 保存被中断的程序的上下文到内核堆栈中，调用这个表项中指明的中断处理函数
+4. 执行中断处理函数
+5. 执行完成后，恢复被中断的进程的上下文，返回用户态，继续运行这个进程
+
+编辑一下trapentry.S 和 trap.c 文件，并且实现上面所说的功能。宏定义 TRAPHANDLER 和 TRAPHANDLER_NOEC 会对你有帮助。你将会在 trapentry.S文件中为在inc/trap.h文件中的每一个trap加入一个入口指， 你也将会提供_alttraps的值
+
+你需要修改trap_init()函数来初始化idt表，使表中每一项指向定义在trapentry.S中的入口指针，SETGATE宏定义在这里用得上
+
+**首先看trap.h**
+
+kern/trap.h中：包含了仅内核可见的idt表和与中断异常有关的函数接口
+
+```c++
+extern struct Gatedesc idt[];
+extern struct Pseudodesc idt_pd;
+
+void trap_init(void);
+void trap_init_percpu(void);
+void print_regs(struct PushRegs *regs);
+void print_trapframe(struct Trapframe *tf);
+void page_fault_handler(struct Trapframe *);
+void backtrace(struct Trapframe *);
+```
+
+inc/trap.h中：包含了不同中断或异常所对应的中断号，保存现场情况的结构体Trapframe的定义
+
+```c++
+// Trap numbers
+// These are processor defined:
+#define T_DIVIDE     0		// divide error
+#define T_DEBUG      1		// debug exception
+#define T_NMI        2		// non-maskable interrupt
+#define T_BRKPT      3		// breakpoint
+#define T_OFLOW      4		// overflow
+#define T_BOUND      5		// bounds check
+#define T_ILLOP      6		// illegal opcode
+#define T_DEVICE     7		// device not available
+#define T_DBLFLT     8		// double fault
+/* #define T_COPROC  9 */	// reserved (not generated by recent processors)
+#define T_TSS       10		// invalid task switch segment
+#define T_SEGNP     11		// segment not present
+#define T_STACK     12		// stack exception
+#define T_GPFLT     13		// general protection fault
+#define T_PGFLT     14		// page fault
+/* #define T_RES    15 */	// reserved
+#define T_FPERR     16		// floating point error
+#define T_ALIGN     17		// aligment check
+#define T_MCHK      18		// machine check
+#define T_SIMDERR   19		// SIMD floating point error
+
+// These are arbitrarily chosen, but with care not to overlap
+// processor defined exceptions or interrupt vectors.
+#define T_SYSCALL   48		// system call
+#define T_DEFAULT   500		// catchall
+
+#define IRQ_OFFSET	32	// IRQ 0 corresponds to int IRQ_OFFSET
+
+// Hardware IRQ numbers. We receive these as (IRQ_OFFSET+IRQ_WHATEVER)
+#define IRQ_TIMER        0
+#define IRQ_KBD          1
+#define IRQ_SERIAL       4
+#define IRQ_SPURIOUS     7
+#define IRQ_IDE         14
+#define IRQ_ERROR       19
+```
+
+**接着看SETGATE定义**
+
+在inc/mmu.h中
+
+```c++
+// gate是IDT表的索引入口，istrap:1代表exception，0代表trap
+// sel是代码段选择子，off是代码段偏移，dpl是描述符特权级
+#define SETGATE(gate, istrap, sel, off, dpl)			\
+{								\
+	(gate).gd_off_15_0 = (uint32_t) (off) & 0xffff;		\
+	(gate).gd_sel = (sel);					\
+	(gate).gd_args = 0;					\
+	(gate).gd_rsv1 = 0;					\
+	(gate).gd_type = (istrap) ? STS_TG32 : STS_IG32;	\
+	(gate).gd_s = 0;					\
+	(gate).gd_dpl = (dpl);					\
+	(gate).gd_p = 1;					\
+	(gate).gd_off_31_16 = (uint32_t) (off) >> 16;		\
+}
+```
+
+**修改trap_init函数**
+
+在kern/trap.c中trap_init()中添加初始化IDT表中各个中断，其中带handler后缀的就是中断入口，GD_KD表示内核数据段
+
+```c++
+// GD_KT 全局描述符， kernel text
+SETGATE(idt[T_DIVIDE], 0, GD_KT, divide_handler, 0);
+SETGATE(idt[T_DEBUG],  0, GD_KT, debug_handler,  0);
+SETGATE(idt[T_NMI],    0, GD_KT, nmi_handler,    0);
+SETGATE(idt[T_BRKPT],  0, GD_KT, brkpt_handler,  3); // 注意DPL要设置为3，不然后面的breakpoint练习会报错
+SETGATE(idt[T_OFLOW],  0, GD_KT, oflow_handler,  0);
+SETGATE(idt[T_BOUND],  0, GD_KT, bound_handler,  0);
+SETGATE(idt[T_DEVICE], 0, GD_KT, device_handler, 0);
+SETGATE(idt[T_ILLOP],  0, GD_KT, illop_handler,  0);
+SETGATE(idt[T_DBLFLT], 0, GD_KT, dblflt_handler, 0);
+SETGATE(idt[T_TSS],    0, GD_KT, tss_handler,    0);
+SETGATE(idt[T_SEGNP],  0, GD_KT, segnp_handler,  0);
+SETGATE(idt[T_STACK],  0, GD_KT, stack_handler,  0);
+SETGATE(idt[T_GPFLT],  0, GD_KT, gpflt_handler,  0);
+SETGATE(idt[T_PGFLT],  0, GD_KT, pgflt_handler,  0);
+SETGATE(idt[T_FPERR],  0, GD_KT, fperr_handler,  0);
+SETGATE(idt[T_ALIGN],  0, GD_KT, align_handler,  0);
+SETGATE(idt[T_MCHK],   0, GD_KT, mchk_handler,   0);
+SETGATE(idt[T_SIMDERR], 0, GD_KT, simderr_handler, 0);
+SETGATE(idt[T_SYSCALL], 0, GD_KT, syscall_handler, 3);
+```
+
+**修改trapentry.S**
+
+在 trapentry.S文件中为在inc/trap.h文件中的每一个trap加入一个入口指针
+
+TRAPHANDLER 和 TRAPHANDLER_NOEC都是将中断号入栈，后跳转到_alltraps去执行
+
+* 这两个宏的差别在于执行的trap是否有error code, 参考官方给出的参考手册可以获知
+* TRAPHANDLER会在中断号入栈前先将error code入栈
+* TRAPHANDLER_NOEC会用0代替error code，并在中断号入栈前先入栈
+
+```c++
+TRAPHANDLER_NOEC(divide_handler, T_DIVIDE);
+TRAPHANDLER_NOEC(debug_handler, T_DEBUG);
+TRAPHANDLER_NOEC(nmi_handler, T_NMI);
+TRAPHANDLER_NOEC(brkpt_handler, T_BRKPT);
+TRAPHANDLER_NOEC(oflow_handler, T_OFLOW);
+TRAPHANDLER_NOEC(bound_handler, T_BOUND);
+TRAPHANDLER_NOEC(illop_handler, T_ILLOP);
+TRAPHANDLER_NOEC(device_handler, T_DEVICE);
+TRAPHANDLER(dblflt_handler, T_DBLFLT);
+TRAPHANDLER(tss_handler, T_TSS);
+TRAPHANDLER(segnp_handler, T_SEGNP);
+TRAPHANDLER(stack_handler, T_STACK);
+TRAPHANDLER(gpflt_handler, T_GPFLT);
+TRAPHANDLER(pgflt_handler, T_PGFLT);
+TRAPHANDLER_NOEC(fperr_handler, T_FPERR);
+TRAPHANDLER(align_handler, T_ALIGN);
+TRAPHANDLER_NOEC(mchk_handler, T_MCHK);
+TRAPHANDLER_NOEC(simderr_handler, T_SIMDERR);
+TRAPHANDLER_NOEC(syscall_handler, T_SYSCALL);
+```
+
+你所实现的 _alltraps 应该：
+
+* 把值压入堆栈使堆栈看起来像一个结构体 Trapframe
+* 加载 GD_KD 的值到 %ds, %es寄存器中
+* 把%esp的值压入，并且传递一个指向Trapframe的指针到trap()函数中
+* 调用trap
+
+需要对照Trapframe结构体（在inc/trap.h里）里每个成员的定义顺序来决定入栈顺序，压入堆栈的顺序是从下到上
+
+* ss,esp已经存在在堆栈里了，cs, eip等通过硬件压入，剩下只有ds,es和tf_regs，因此通过pushl依次压入ds和es
+* pushal 指令将所有通用寄存器 (%eax, %ecx, %edx, %ebx, %esp, %ebp, %esi, %edi) 的值压入栈中，因此使用pushal压入的是tf_regs
+
+```c++
+// inc/trap.h
+struct PushRegs {
+	/* registers as pushed by pusha */
+	uint32_t reg_edi;
+	uint32_t reg_esi;
+	uint32_t reg_ebp;
+	uint32_t reg_oesp;		/* Useless */
+	uint32_t reg_ebx;
+	uint32_t reg_edx;
+	uint32_t reg_ecx;
+	uint32_t reg_eax;
+} __attribute__((packed));
+
+struct Trapframe {
+	struct PushRegs tf_regs;
+	uint16_t tf_es;
+	uint16_t tf_padding1;
+	uint16_t tf_ds;
+	uint16_t tf_padding2;
+	uint32_t tf_trapno;
+	/* below here defined by x86 hardware */
+	uint32_t tf_err;
+	uintptr_t tf_eip;
+	uint16_t tf_cs;
+	uint16_t tf_padding3;
+	uint32_t tf_eflags;
+	/* below here only when crossing rings, such as from user to kernel */
+	uintptr_t tf_esp;
+	uint16_t tf_ss;
+	uint16_t tf_padding4;
+} __attribute__((packed));
+
+
+// trapentry.S
+.globl _alltraps
+_alltraps:
+	pushl %ds;
+	pushl %es;
+	pushal;
+  // 将一个段选择子（这里是 GD_KD）加载到 AX 寄存器，然后将其值加载到 DS 和 ES 寄存器中。这样做的目的是将数据段寄存器设置为内核数据段
+	movw $GD_KD, %ax;
+	movw %ax, %ds;
+	movw %ax, %es;
+  // 将当前栈指针 %esp 的值压入栈中。这是为了将当前堆栈的地址作为参数传递给下一个调用的函数
+	pushl %esp;        
+	call trap
+```
+
+**最后检验**
+
+可看出已经不会报tripple fault了
+
+![](fig/2024-06-04-20-49-21.png)
+
+**Question**
+
+1. 为每个异常/中断提供单独的处理函数的目的是什么？ （即，如果所有异常/中断都传递给同一个处理程序，则无法提供当前实现中存在的哪些功能？）
+
+答：不同的中断或者异常当然需要不同的中断处理函数，因为不同的异常/中断可能需要不同的处理方式，比如有些异常是代表指令有错误，则不会返回被中断的命令。而有些中断可能只是为了处理外部IO事件，此时执行完中断函数还要返回到被中断的程序中继续运行。
+
+2. 为什么用户态下中的中断14会进入中断向量13？
+
+答：因为当前的系统正在运行在用户态下，特权级为3，而INT指令为系统指令，特权级为0。特权级为3的程序不能直接调用特权级为0的程序，会引发一个General Protection Exception，即trap 13
+
+### Part B: Page Faults, Breakpoints Exceptions, and System Calls
+
+##### exercise 5
+
+缺页中断（中断号14）是一个非常重要的中断，因为我们在后续的实验中，非常依赖于能够处理缺页中断的能力。当缺页中断发生时，系统会把引起中断的线性地址存放到控制寄存器 CR2 中。在trap.c 中，已经提供了一个能够处理这种缺页异常的函数page_fault_handler()
+
+修改一下 trap_dispatch 函数，使系统能够把缺页异常引导到 page_fault_handler() 上执行。在修改完成后，运行 make grade，出现的结果应该是你修改后的 JOS 可以成功运行 faultread，faultreadkernel，faultwrite，faultwritekernel 测试程序
+
+也可以使用make run-x或make run-x-nox将JOS引导到特定的用户程序中。例如，让make run-hello-nox运行hello用户程序
+
+根据 trapentry.S 文件中的 TRAPHANDLER 函数可知，这个函数会把当前中断的中断码压入堆栈中，再根据 inc/trap.h 文件中的 Trapframe 结构体我们可以知道，Trapframe 中的 tf_trapno 成员代表这个中断的中断码。所以在 trap_dispatch 函数中我们需要根据输入的 Trapframe 指针 tf 中的 tf_trapno 成员来判断到来的中断是什么中断，这里我们需要判断是否是缺页中断，如果是则执行 page_fault_handler 函数
+
+```c++
+// kern/trap.c
+switch(tf->tf_trapno) { 
+  case (T_PGFLT):
+      page_fault_handler(tf);
+      break; 
+   default:
+      // Unexpected trap: The user process or the kernel has a bug.
+      print_trapframe(tf);
+      if (tf->tf_cs == GD_KT)
+          panic("unhandled trap in kernel");
+      else {
+          env_destroy(curenv);
+          return;
+      }
+}
+```
+
+执行```make grade```，可看到四个测试程序都通过
+
+![](fig/2024-06-04-21-39-47.png)
+
+##### exercise 6
+
+断点异常，异常号为3，这个异常可以让调试器能够给程序加上断点。加断点的基本原理就是把要加断点的语句用一个 INT3 指令替换，执行到INT3时，会触发软中断。在JOS中，我们将通过把这个异常转换成一个伪系统调用，这样的话任何用户环境都可以使用这个伪系统调用来触发JOS kernel monitor
+
+修改trap_dispatch()使断点异常发生时，能够触发kernel monitor
+
+与上面的练习同理，在trap_dispatch函数中增加断点中断即可
+
+```c++
+// kern/trap.c
+  case (T_BRKPT):
+      monitor(tf); // 调出shell的monitor
+
+// kern/monitor.c
+void
+
+monitor(struct Trapframe *tf)
+{
+	char *buf;
+	cprintf("Welcome to the JOS kernel monitor!\n");
+	cprintf("Type 'help' for a list of commands.\n");
+	if (tf != NULL)
+		print_trapframe(tf);
+	while (1) {
+		buf = readline("K> ");
+		if (buf != NULL)
+			if (runcmd(buf, tf) < 0)
+				break;
+	}
+}
+```
+
+执行```make grade```，可看到breakpoint测试程序通过
+
+![](fig/2024-06-04-21-49-39.png)
+
+**Question**
+
+在上面的break point exception测试程序中，如果你在设置IDT时，对break point exception采用不同的方式进行设置，可能会产生触发不同的异常，有可能是break point exception，有可能是 general protection exception。这是为什么？你应该怎么做才能得到一个我们想要的breakpoint exception，而不是general protection exception？
+
+答：通过实验发现出现这个现象的问题就是在设置IDT表中的breakpoint exception的表项时，如果我们把表项中的DPL字段设置为3，则会触发break point exception，如果设置为0，则会触发general protection exception。
+
+DPL字段代表的含义是段描述符优先级（Descriptor Privileged Level），如果我们想要当前执行的程序能够跳转到这个描述符所指向的程序哪里继续执行的话，有个要求，就是要求当前运行程序的CPL，RPL的最大值需要小于等于DPL，否则就会出现优先级低的代码试图去访问优先级高的代码的情况，就会触发general protection exception。
+
+我们的测试程序首先运行于用户态，它的CPL为3，当异常发生时，它希望去执行 int 3指令，这是一个系统级别的指令，用户态命令的CPL一定大于 int 3 的DPL=0，所以就会触发general protection exception，但是如果把IDT这个表项的DPL设置为3时，就不会出现这样的现象了，这时如果再出现异常，肯定是因为我们还没有编写处理break point exception的程序所引起的，所以是break point exception
