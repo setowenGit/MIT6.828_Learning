@@ -1162,6 +1162,7 @@ switch(tf->tf_trapno) {
 // kern/trap.c
   case (T_BRKPT):
       monitor(tf); // 调出shell的monitor
+	  break;
 
 // kern/monitor.c
 void
@@ -1195,3 +1196,223 @@ monitor(struct Trapframe *tf)
 DPL字段代表的含义是段描述符优先级（Descriptor Privileged Level），如果我们想要当前执行的程序能够跳转到这个描述符所指向的程序哪里继续执行的话，有个要求，就是要求当前运行程序的CPL，RPL的最大值需要小于等于DPL，否则就会出现优先级低的代码试图去访问优先级高的代码的情况，就会触发general protection exception。
 
 我们的测试程序首先运行于用户态，它的CPL为3，当异常发生时，它希望去执行 int 3指令，这是一个系统级别的指令，用户态命令的CPL一定大于 int 3 的DPL=0，所以就会触发general protection exception，但是如果把IDT这个表项的DPL设置为3时，就不会出现这样的现象了，这时如果再出现异常，肯定是因为我们还没有编写处理break point exception的程序所引起的，所以是break point exception
+
+##### exercise 7
+
+用户程序会要求内核帮助它完成系统调用。当用户程序触发系统调用，系统进入内核态。处理器和操作系统将保存该用户程序当前的上下文状态，然后由内核将执行正确的代码完成系统调用，然后回到用户程序继续执行
+
+在JOS中，我们会采用int指令，这个指令会触发一个处理器的中断。特别的，我们用```int $0x30```来代表系统调用中断。注意，中断0x30不是通过硬件产生的
+
+应用程序会把系统调用号以及系统调用的参数放到寄存器中。通过这种方法，内核就不需要去查询用户程序的堆栈了。系统调用号存放到 %eax 中，参数则存放在 %edx, %ecx, %ebx, %edi, 和 %esi 中。内核会把返回值送到 %eax中
+
+给中断向量T_SYSCALL编写一个中断处理函数
+
+**检查 inc/trap.h, kern/trap.c 和 trapentry.S**
+
+在上述三个文件中都已存在与T_SYSCALL相关的定义
+
+```c++
+// inc/trap.h
+#define T_SYSCALL   48
+// kern/trap.c
+void syscall_handler();
+SETGATE(idt[T_SYSCALL], 0, GD_KT, syscall_handler, 3);
+// trapentry.S
+TRAPHANDLER_NOEC(syscall_handler, T_SYSCALL);
+```
+
+**两个syscall.c**
+
+存在两个syscall.c文件，分别为 kern/syscall.c 和 lib/syscall.c，其中都含有syscall函数，如下
+
+* 当程序在内核态时，就是运行kern/这个目录下的文件，反之，如果是在lib下，就是在用户态下会运行的文件
+* 前者处理系统调用的具体实现，后者提供对系统调用的用户态接口
+* 如果现在运行的是内核态的程序的话，此时调用了一个系统调用，比如 sys_cputs 函数时，此时不会触发中断，系统直接执行定义在kern/syscall.c 文件中的 sys_cputs
+* 当程序运行在用户态下，进行系统调用，其中的汇编代码就通过INT指令产生软件中断，程序陷入内核执行。之前已经设置到了SYSCALL的中断处理入口，然后我们就是要在trap_dispatch函数中进行相应的中断处理
+
+```c++
+// kern/syscall.c
+syscall(uint32_t syscallno, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5)
+// lib/syscall.c
+syscall(int num, int check, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5)
+```
+
+**修改trap_dispatch函数**
+
+在kern/trap.c中
+
+```c++
+case T_SYSCALL:
+			tf->tf_regs.reg_eax = syscall(tf->tf_regs.reg_eax, 
+											tf->tf_regs.reg_edx, 
+											tf->tf_regs.reg_ecx, 
+											tf->tf_regs.reg_ebx, 
+											tf->tf_regs.reg_edi, 
+											tf->tf_regs.reg_esi);
+			break;
+```
+
+**修改syscall函数**
+
+在 kern/syscall.c 中
+
+```c++
+int32_t
+syscall(uint32_t syscallno, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5)
+{
+	switch (syscallno) {
+	case SYS_cputs:
+		sys_cputs((const char*)a1,a2);
+	        break;
+	case SYS_cgetc:
+	       return  sys_cgetc();
+	case SYS_getenvid:
+                return sys_getenvid();
+	case SYS_env_destroy:
+		return sys_env_destroy(a1);
+ 
+	default:
+		return -E_INVAL;
+	}
+	return 0;
+}
+```
+
+输入命令```make run-hello```如下，在控制台上打印“hello world”，然后在用户模式下导致页面错误
+
+![](fig/2024-06-12-15-25-21.png)
+
+输入命令```make grade```，现在testbss可以通过
+
+![](fig/2024-06-12-15-26-04.png)
+
+##### exercise 8
+
+用户程序真正开始运行的地方是在lib/entry.S文件中。该文件中，首先会进行一些设置，然后就会调用lib/libmain.c 文件中的 libmain() 函数。你首先要修改一下 libmain() 函数，使它能够初始化全局指针 thisenv ，让它指向当前用户环境的 Env 结构体
+
+然后 libmain() 函数就会调用 umain，这个 umain 程序恰好是 user/hello.c 中被调用的函数。在之前的实验中我们发现，hello.c程序只会打印 "hello, world" 这句话，然后就会报出 page fault 异常，原因就是 thisenv->env_id 这条语句，在 user/hello.c 中打印"hello, world"后会调用thisenv
+
+```c++
+cprintf("i am environment %08x\n", thisenv->env_id);
+```
+
+把我们刚刚提到的应该补全的代码补全，然后重新启动内核，此时你应该看到 user/hello 程序会打印 "hello, world", 然后在打印出来 "i am environment 00001000"。user/hello 然后就会尝试退出，通过调用 sys_env_destroy()。由于内核目前仅仅支持一个用户运行环境，所以它应该汇报 “已经销毁用户环境”的消息，然后退回内核监控器(kernel monitor)
+
+其实就是让你通过程序获得当前正在运行的用户环境的 env_id , 以及这个用户环境所对应的 Env 结构体的指针
+* env_id 我们可以通过调用 sys_getenvid() 这个函数来获得
+* 通过阅读 inc/env.h 文件我们知道，env_id的值包含三部分，第31位被固定为0；第10—30这21位是标识符，标示这个用户环境；第0—9位代表这个用户环境所采用的 Env 结构体，在envs数组中的索引。所以我们只需知道 env_id 的低 0—9 位，我们就可以获得这个用户环境对应的 Env 结构体了
+
+```
+An environment ID 'envid_t' has three parts:
++1+---------------21-----------------+--------10--------+
+|0|          Uniqueifier             |   Environment    |
+| |                                  |      Index       |
++------------------------------------+------------------+
+                                      \--- ENVX(eid) --/
+```
+
+**修改libmain函数**
+
+在 lib/libmian.c 文件中给 thisenv 赋值当前环境的Env结构体在 envs 中的索引即可
+
+```c++
+void
+libmain(int argc, char **argv)
+{
+	// set thisenv to point at our Env structure in envs[].
+	// LAB 3: Your code here.
+	thisenv = &envs[ENVX(sys_getenvid())];
+	// save the name of the program so that panic() can use it
+	if (argc > 0)
+		binaryname = argv[0];
+	// call user main routine
+	umain(argc, argv);
+	// exit gracefully
+	exit();
+}
+```
+输入命令```make run-hello```后现在能够打印出“i am environment ...”的字符串
+
+![](fig/2024-06-12-16-02-54.png)
+
+输入命令```make grade```，可发现hello测试通过
+
+![](fig/2024-06-12-16-02-21.png)
+
+##### exercise 9
+
+内存保护是操作系统的非常重要的一项功能，让我们考虑一下可自动扩展的堆栈。在许多系统中，内核在初始情况下只会分配一个内核堆栈页，如果程序想要访问这个内核堆栈页之外的堆栈空间的话，就会触发异常，此时内核会自动再分配一些页给这个程序，程序就可以继续运行了
+
+系统调用也为内存保护带来了问题。大部分系统调用接口让用户程序传递一个指针参数给内核。这些指针指向的是用户缓冲区。通过这种方式，系统调用在执行时就可以解引用这些指针。但是这里有两个问题：
+
+* 在内核中的page fault要比在用户程序中的page fault更严重。如果内核在操作自己的数据结构时出现 page faults，这是一个内核的bug，而且异常处理程序会中断整个内核。但是当内核在解引用由用户程序传递来的指针时，它需要一种方法去记录此时出现的任何page faults都是由用户程序带来的
+* 内核通常比用户程序有着更高的内存访问权限。用户程序很有可能要传递一个指针给系统调用，这个指针指向的内存区域是内核可以进行读写的，但是用户程序不能。此时内核必须小心不要去解析这个指针，否则的话内核的重要信息很有可能被泄露
+
+现在你需要通过仔细检查所有由用户传递来指针所指向的空间来解决上述两个问题
+
+**修改page_fault_handler函数**
+
+首先我们应该根据 CS 段寄存器的低2位来判断当前运行的程序时处在内核态下还是用户态下，这两位的名称叫做 CPL 位，表示当前运行的代码的访问权限级别
+* 0代表是内核态
+* 3代表是用户态
+
+题目要求我们在检测到这个 page fault 是出现在内核态时，要把这个事件 panic 出来
+
+在 kern/trap.c 的page_fault_handler函数中加入
+
+```c++
+if(tf->tf_cs && 3 == 0) {
+    panic("page_fault in kernel mode, fault address %d\n", fault_va);
+}
+```
+
+**修改user_mem_check函数**
+
+然后根据题目的要求，我们还要继续完善 kern/pmap.c 文件中的 user_mem_assert , user_mem_check 函数，通过观察 user_mem_assert 函数我们发现，它调用了 user_mem_check 函数
+
+user_mem_check 函数的功能是检查一下当前用户态程序是否有对虚拟地址空间 ```[va, va+len]``` 的 ```perm | PTE_P``` 访问权限
+
+我们要做的事情应该是，先找到这个虚拟地址范围对应于当前用户态程序的页表中的页表项，然后再去看一下这个页表项中有关访问权限的字段，是否包含 ```perm | PTE_P```，只要有一个页表项是不包含的，就代表程序对这个范围的虚拟地址没有 ```perm | PTE_P``` 的访问权限
+
+```c++
+int
+user_mem_check(struct Env *env, const void *va, size_t len, int perm)
+{
+	// LAB 3: Your code here.
+	uint32_t start = (uint32_t)ROUNDDOWN((char *)va, PGSIZE);
+	uint32_t end = (uint32_t)ROUNDUP((char *)va+len, PGSIZE);
+	for(; start < end; start += PGSIZE) {
+		pte_t *pte = pgdir_walk(env->env_pgdir, (void*)start, 0);
+		if((start >= ULIM) || (pte == NULL) || !(*pte & PTE_P) || ((*pte & perm) != perm)) {
+			user_mem_check_addr = (start < (uint32_t)va ? (uint32_t)va : start);
+			return -E_FAULT;
+		}
+	}
+	return 0;
+}
+```
+
+**补全sys_cputs函数**
+
+最后按照题目要求我们还要补全 kern/syscall.c 文件中的一部分内容，即 sys_cputs 函数，这个函数要求检查用户程序对虚拟地指空间 ```[s, s+len]``` 是否有访问权限，所以我们恰好可以使用函数  user_mem_assert() 来实现
+
+```c++
+static void
+sys_cputs(const char *s, size_t len)
+{
+	// Check that the user has permission to read memory [s, s+len).
+	// Destroy the environment if not.
+	// LAB 3: Your code here.
+	user_mem_assert(curenv, (const void *) s, len, 0);
+	// Print the string supplied by the user.
+	cprintf("%.*s", len, s);
+}
+```
+
+启动内核后，运行 user/buggyhello 程序，输入命令```make run-buggyhello```，用户环境可以被销毁，内核不可以panic，你应该看到
+
+![](fig/2024-06-12-16-57-17.png)
+
+输入命令```make grade```，可发现 buggyhello 和 evilhello 测试通过
+
+![](fig/2024-06-12-16-59-06.png)
