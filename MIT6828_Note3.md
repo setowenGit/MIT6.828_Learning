@@ -191,4 +191,141 @@ holding(struct spinlock *lock)
 
 所以，根据代码逻辑可以知道，当前cpu已经获取了锁的情况下，再次请求上锁会导致panic
 
+## Lab 4: Preemptive Multitasking
 
+在实验4中，新增了如下新的代码
+
+* kern/cpu.h 多处理器支持的内核私有定义
+* kern/mpconfig.c 读取多处理器配置的代码
+* kern/lapic.c 驱动每个处理器中的本地 APIC 单元的内核代码
+* kern/mpentry.S 非引导 CPU 的汇编语言入口代码
+* kern/spinlock.h 自旋锁的内核私有定义，包括大内核锁
+* kern/spinlock.c 实现自旋锁的内核代码
+* kern/sched.c 您将要实现的调度程序的代码框架
+
+### Part A: Multiprocessor Support and Cooperative Multitasking
+
+#### Multiprocessor Support
+
+我们将使JOS支持“对称多处理”(symmetric multiprocessing, SMP)——一种多处理模型。在这种模型中，所有的处理器都可以同等地使用系统资源，如内存和输入/输出总线。虽然所有的处理器在功能上都是相同的，但在引导过程中，他们可以分为两种类型：
+
+* bootstrap processor (BSP): 负责初始化系统和引导操作系统
+* application processors (APs): 只有在操作系统启动并运行之后，应用处理器才被BSP激活
+
+哪个处理器是BSP由硬件和BIOS决定。到目前为止，所有JOS代码都在BSP上运行
+
+在SMP系统中，每个CPU都有一个配套的local APIC(LAPIC)单元。LAPIC单元负责在整个系统中传递中断。LAPIC还为其连接的CPU提供一个唯一的标识符。在本实验中，我们利用了LAPIC单元的以下基本功能(在kern/lapic.c中)
+
+1. 读取LAPIC标识(APIC ID)来判断我们的代码当前运行在哪个处理器上
+2. 把STARUP处理器间中断(IPI)从BSP发送到APs以启动其他处理器(参见lapic_startap())
+3. 在Part C中，我们对LAPIC的内置定时器进行编程，以触发时钟中断来支持抢占式多任务处理
+
+处理器使用内存映射I/O(MMIO)来访问其LAPIC。在MMIO中，物理存储器的一部分被硬连线到一些IO设备的寄存器，因此通常用于访问存储器的相同的load/store指令可以用于访问设备寄存器。在物理地址0xA0000处可以看到一个IO hole(我们用它来写入VGA显示缓冲区)
+
+LAPIC的 hole 开始于物理地址0xFE000000(4GB位置仅差32MB)，但是这地址太高我们无法访问通过过去的直接映射(虚拟地址0xF0000000映射0x0，即只有256MB)。但是JOS虚拟地址映射预留了4MB空间在MMIOBASE处，我们需要分配映射空间
+
+###### exercise 1
+
+在kern/pmap.c文件中实现mmio_map_region. 要了解如何使用它，需要查看kern/lapic.c中lapic_init的开头。在运行mmio_map_region测试之前，必须做完下一个练习
+
+如下所示
+
+```c++
+// 在MMIO区域保留大小字节，并在此位置映射[pa,pa+size]。
+// 返回保留区域的基数。size参数不一定是PGSIZE的倍数。
+void *
+mmio_map_region(physaddr_t pa, size_t size)
+{
+	static uintptr_t base = MMIOBASE;
+	// 预留虚拟内存的大小字节,从基数开始,将物理页[pa,pa+size]映射到虚拟地址[base,base+size].
+    // 由于这是设备内存,而不是普通的DRAM,你必须告诉CPU,对这个内存进行缓存访问是不安全的.
+    // 幸运的是,pagetables提供了用于此目的的二进制位；只需在PTE_W之外再加上PTE_PCD|PTE_PWT（禁用缓存和write-through）来创建映射
+	void *ret = (void *)base;
+	size = ROUNDUP(size, PGSIZE);
+	if (base + size > MMIOLIM || base + size < base) {
+		panic("mmio_map_region reservation overflow\n");
+	}
+	boot_map_region(kern_pgdir, base, size, pa, PTE_W|PTE_PCD|PTE_PWT);
+	base += size; // 注意base是静态的，需要时时更新
+	return ret;
+}
+```
+
+##### Application Processor Bootstrap
+
+AP启动流程：
+
+1. 在启动APs之前，BSP首先应该收集关于多处理器系统的信息，例如CPU的总数，它们的APIC ID，和LAPIC单元的MMIO地址。kern/mpconfig.c中的mp_init()函数通过读取驻留在BIOS内存区域中的MP配置表来检索该信息
+2. boot_aps函数(在kern/init.c中)驱动AP引导进程。APs在实模式下启动，就像引导程序在boot/boot.S下启动一样。所以boot_aps会复制AP入口代码地址(kern/mpentry.S)到在实模式下可寻址的存储器位置
+3. 与引导加载程序不同，我们可以控制应用程序从哪里开始执行代码，我们将入口代码复制到0x7000(MPETRY_PADDR)，但是任何未使用的、页面对齐的低于640KB的物理地址都可以工作
+4. 在这之后，boot_aps()通过向相应AP的LAPIC单元发送STARTUP IPI和一个初始CS:IP地址，AP应该在该地址开始运行其入口代码(MPENTRY_PADDR)，一个接一个地激活APs。在kern/mpentry.S中的入口代码跟boot/boot.S中的代码类似
+5. 在一些简单的配置后，它使AP进入开启分页机制的保护模式，然后调用C语言的setup函数mp_main. boot_aps等待AP在其结构CpuInfo的cpu_status字段中发出CPU_STARTED标志信号，然后再唤醒下一个
+
+###### exercise 2
+
+修改kern/pmap.c中实现的page_init()，以避免将MPENTRY_PADDR页面添加到空闲列表中，这样我们就可以安全复制并运行该物理地址上的AP引导代码，代码通过check_page_free_list测试
+
+首先需要理解boot_aps()函数
+
+```c++
+// 存储有AP的入口函数地址的物理地址
+#define MPENTRY_PADDR	0x7000
+// cpu的内核栈，在这里使用数组实现
+unsigned char percpu_kstacks[NCPU][KSTKSIZE]
+// cpu信息结构体
+struct CpuInfo {
+	uint8_t cpu_id;                 // cpu的id，对应cpus数组的索引
+	volatile unsigned cpu_status;   // cpu的状态
+	struct Env *cpu_env;            // cpu中正在运行的进程（环境）
+	struct Taskstate cpu_ts;        // 内核栈状态
+};
+
+// 启动APs
+static void
+boot_aps(void)
+{
+	extern unsigned char mpentry_start[], mpentry_end[];
+	void *code;
+	struct CpuInfo *c;
+	// 将入口函数地址复制到物理地址 MPENTRY_PADDR 所对应的虚拟地址上
+	code = KADDR(MPENTRY_PADDR);
+	memmove(code, mpentry_start, mpentry_end - mpentry_start);
+	// 在循环里每次启动一个AP
+	for (c = cpus; c < cpus + ncpu; c++) {
+		// 如果cpu结构体c与现在正在运行的cpu结构体相同，说明该AP已经启动了
+		if (c == cpus + cpunum())
+			continue;
+		// mpentry_kstack存有分配给该AP的栈的栈顶地址
+		mpentry_kstack = percpu_kstacks[c - cpus] + KSTKSIZE;
+		// 从MPENTRY_PADDR中存储的AP的入口函数地址开始，启动AP
+		lapic_startap(c->cpu_id, PADDR(code));
+		// 等待AP发出的CPU_STARTED信号
+		while(c->cpu_status != CPU_STARTED)
+			;
+	}
+}
+```
+
+* 上面的lapic_startap()函数相当于往一个全局内存lapic中写入数据，从而完成BSP与AP的通讯
+* lapic是在lapic_init()函数中通过exercise 1中修改的mmio_map_region()函数实现赋值的,具体来说是代码```lapic = mmio_map_region(lapicaddr, 4096);```
+* lapicaddr是LAPIC的IO hole的地址，在mmio_map_region()中就是将这个地址映射到MMIOBASE上，从而BSP可以访问到MMIOBASE上的数据，从而实现与LAPIC以内存映射IO方式的通讯交流
+
+接着要理解mpentry.S汇编文件
+
+* 这段代码其实就是AP的入口函数，是上面boot_aps函数中的以```mpentry_start```为起止地址的代码，上述函数就是将这段代码复制到MPENTRY_PADDR起始的位置上
+* 这个汇编文件主要做的事情是跳转到c语言函数mp_main()中
+
+接着要理解mp_main()函数
+
+* 主要完成lapic的初始化，加载GDT以及段描述符，初始化并加载所有CPU的TSS、和 IDT
+* 最后将cpu状态设置为CPU_STARTED，那么boot_aps函数将退出while
+
+修改page_init，增加一个判断条件，将MPENTRY_PADDR这一页设置为已使用
+
+```c++
+uint32_t mpentry_pn = ((uint32_t) KADDR(MPENTRY_PADDR) - KERNBASE) / PGSIZE;
+
+else if(i == mpentry_pn) {
+			pages[i].pp_ref = 1;
+		}
+```
