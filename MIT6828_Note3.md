@@ -231,6 +231,9 @@ LAPIC的 hole 开始于物理地址0xFE000000(4GB位置仅差32MB)，但是这�
 如下所示
 
 ```c++
+volatile uint32_t *lapic;
+lapic = mmio_map_region(lapicaddr, 4096);
+
 // 在MMIO区域保留大小字节，并在此位置映射[pa,pa+size]。
 // 返回保留区域的基数。size参数不一定是PGSIZE的倍数。
 void *
@@ -265,20 +268,13 @@ AP启动流程：
 
 修改kern/pmap.c中实现的page_init()，以避免将MPENTRY_PADDR页面添加到空闲列表中，这样我们就可以安全复制并运行该物理地址上的AP引导代码，代码通过check_page_free_list测试
 
-首先需要理解boot_aps()函数
+**首先需要理解boot_aps()函数**
 
 ```c++
 // 存储有AP的入口函数地址的物理地址
 #define MPENTRY_PADDR	0x7000
 // cpu的内核栈，在这里使用数组实现
 unsigned char percpu_kstacks[NCPU][KSTKSIZE]
-// cpu信息结构体
-struct CpuInfo {
-	uint8_t cpu_id;                 // cpu的id，对应cpus数组的索引
-	volatile unsigned cpu_status;   // cpu的状态
-	struct Env *cpu_env;            // cpu中正在运行的进程（环境）
-	struct Taskstate cpu_ts;        // 内核栈状态
-};
 
 // 启动APs
 static void
@@ -310,17 +306,19 @@ boot_aps(void)
 * lapic是在lapic_init()函数中通过exercise 1中修改的mmio_map_region()函数实现赋值的,具体来说是代码```lapic = mmio_map_region(lapicaddr, 4096);```
 * lapicaddr是LAPIC的IO hole的地址，在mmio_map_region()中就是将这个地址映射到MMIOBASE上，从而BSP可以访问到MMIOBASE上的数据，从而实现与LAPIC以内存映射IO方式的通讯交流
 
-接着要理解mpentry.S汇编文件
+**接着要理解mpentry.S汇编文件**
 
 * 这段代码其实就是AP的入口函数，是上面boot_aps函数中的以```mpentry_start```为起止地址的代码，上述函数就是将这段代码复制到MPENTRY_PADDR起始的位置上
 * 这个汇编文件主要做的事情是跳转到c语言函数mp_main()中
 
-接着要理解mp_main()函数
+**接着要理解mp_main()函数**
 
 * 主要完成lapic的初始化，加载GDT以及段描述符，初始化并加载所有CPU的TSS、和 IDT
 * 最后将cpu状态设置为CPU_STARTED，那么boot_aps函数将退出while
 
-修改page_init，增加一个判断条件，将MPENTRY_PADDR这一页设置为已使用
+**修改page_init**
+
+* 增加一个判断条件，将MPENTRY_PADDR这一页设置为已使用
 
 ```c++
 uint32_t mpentry_pn = ((uint32_t) KADDR(MPENTRY_PADDR) - KERNBASE) / PGSIZE;
@@ -329,3 +327,98 @@ else if(i == mpentry_pn) {
 			pages[i].pp_ref = 1;
 		}
 ```
+
+**Question:** 将kern/mpentry.S与boot/boot.S并排比较，kern/mpentry.S就像内核中的其他内容一样在KERNBASE地址之上被编译链接运行，宏定义MPBOOTPHYS的目的是什么？什么不是在boot/boot.S但是是在kern/mpentry.S必要的？换句话说，如果在kern/mpentry中省略了它，会出现什么问题？
+
+在mpentry.S的注释里面有写这两者的区别：与boot/boot.S类似,只是
+
+* 它不需要启用A20
+* 它使用MPBOOTPHYS来计算其符号的绝对地址,而不是依靠链接器来填充它们
+
+这种转换是因为bootloader的LMA和VMA都在0x7c00，所以运行boot.S时虚拟地址就是物理地址，不需要转换。但是kernel中的则不然，主CPU已经处于保护模式下了，因此是不能直接指定物理地址，需要进行虚拟地址到物理地址的转换。
+
+而在加载GDT的时候需要物理地址，所以宏定义MPBOOTPHYS的作用就是将虚拟地址s转换为物理地址：
+
+```c++
+#define MPBOOTPHYS(s) ((s) - mpentry_start + MPENTRY_PADDR)
+```
+
+mpentry_start就是AP入口函数的虚拟地址，而MPENTRY_PADDR是对应的物理地址。相当于是把gdt的位置相对于mpentry_start的地址对应到MPENTRY_PADDR + gdt - mpentry_start，就如同boot.S中gdt对应到在start + gdt - start
+
+##### Per-CPU State and Initialization
+
+在编写多处理操作系统时，区分每个处理器专用的per-CPU状态和整个系统共享的全局状态非常重要。kern/cpu.h定义了大部分的per-CPU状态，包括存储per-CPU变量的结构CpuInfo. cpunum()总是返回调用它的CPU的ID，可以用作像CPU这样的数组的索引。另外，宏thiscpu是当前cpu结构CpuInfo的简写
+
+```c++
+// cpu信息结构体
+struct CpuInfo {
+	uint8_t cpu_id;                 // cpu的id，对应cpus数组的索引
+	volatile unsigned cpu_status;   // cpu的状态
+	struct Env *cpu_env;            // cpu中正在运行的进程（环境）
+	struct Taskstate cpu_ts;        // 内核栈状态TSS
+};
+```
+
+* Per-CPU kernel stack: 因为多个CPU可以同时陷入到内核，所以每个处理器需要一个单独的内核堆栈，以防止它们相互干扰执行
+  * 数组percpu_kstack[NCPU][KSTKSIZE]为NCPU的内核堆栈保留空间
+  * 在Lab2中，映射了bootstack，是BSP内核堆栈的物理内存，该内核堆栈位于KSTACKTOP之下
+  * 相似的，在这个lab中，会映射每个CPU的内核堆栈到这个区域，并使用保护页面(guard pages)作为它们之间的缓冲区(buffer)，避免某个CPU内存溢出了干扰到其他CPU的栈
+  * CPU 0的堆栈仍然会从KSTACKTOP向下增长；CPU 1的堆栈将在CPU 0的堆栈底部以下启动KSTKGAP字节，以此类推，inc/memlayout.h显示了映射布局
+* Per-CPU TSS and TSS descriptor: per-CPU的任务状态段(task state segment, TSS), 指定每个CPU的内核栈位于何处。CPU i的TSS存在于cpus[i].cpu_ts中，相应的TSS描述符定义在GDT条目的gdt[(GD_TSS0 >> 3) + i]中。定义在kern/trap.c中的全局ts变量不再有用
+* Per-CPU current environment pointer: 因为每个CPU可以同时运行不同用户程序，我们可以重新定义符号curenv成cpus[cpunum()].cpu_env( or thiscpu->cpu_env)，它将指向当前CPU上正在执行的environment
+* Per-CPU system registers: 所有寄存器，包括系统寄存器都是CPU私有的。因此，初始化这些寄存器的指令，例如lcr3(), ltr()，lgbt(), lidt()等等，都必须在每个CPU上执行一次。函数env_init_percpu()和trap_init_percpu()就是为这个定义的
+
+###### exercise 3
+
+修改在kern/pmap.c中的mem_init_mp()去映射从KSTACKTOP开始的per-CPU栈，如inc/memlayout.h所示。每个stack的大小都是KSTKSIZE字节加未映射保护页(guard pages)的KSTKGAP字节。代码应该通过check_kern_pgdir()的检测
+
+主要是遍历每个CPU，当遍历到CPU i时，将数组percpu_kstacks[i]所对应的内存映射到kstacktop_i - KSTKSIZE上
+
+```c++
+static void
+mem_init_mp(void)
+{
+	size_t i;
+	size_t kstacktop_i;
+	for(i = 0; i < NCPU; i++) {
+		kstacktop_i = KSTACKTOP - i * (KSTKSIZE + KSTKGAP);
+		boot_map_region(kern_pgdir, kstacktop_i - KSTKSIZE, KSTKSIZE,
+						PADDR(&percpu_kstacks[i]), PTE_W );
+	}
+}
+
+```
+
+###### exercise 4
+
+在kern/trap.c中的trap_init_percpu()中的代码初始化BSP的TSS和TSS描述符。它在实验3中有效。但是在其他处理器上运行时不正确，更改代码，以便他可以在所有CPU上工作（注意：新代码不应该使用ts全局变量了）
+
+在这里并不是要对所有的CPU进行init，实际上此时代码执行发生在不同的CPU上，只需要对自身CPU进行初始化即可。即使用 ```thiscpu->cpu_ts``` 代替之前的全局变量 ```ts```
+
+```c++
+void
+trap_init_percpu(void)
+{
+	// Setup a TSS so that we get the right stack
+	// when we trap to the kernel.
+	// ts.ts_esp0 = KSTACKTOP;
+	// ts.ts_ss0 = GD_KD;
+	// ts.ts_iomb = sizeof(struct Taskstate);
+	thiscpu->cpu_ts.ts_esp0 = KSTACKTOP - cpunum() * (KSTKGAP + KSTKSIZE);
+    thiscpu->cpu_ts.ts_ss0 = GD_KD;
+	thiscpu->cpu_ts.ts_iomb = sizeof(struct Taskstate);
+	// Initialize the TSS slot of the gdt.
+	// gdt[GD_TSS0 >> 3] = SEG16(STS_T32A, (uint32_t) (&ts), sizeof(struct Taskstate) - 1, 0);
+	// gdt[GD_TSS0 >> 3].sd_s = 0;
+	gdt[(GD_TSS0 >> 3) + cpunum()] = SEG16(STS_T32A, (uint32_t) (&thiscpu->cpu_ts), sizeof(struct Taskstate) - 1, 0);
+    gdt[(GD_TSS0 >> 3) + cpunum()].sd_s = 0;
+	// Load the TSS selector (like other segment selectors, the
+	// bottom three bits are special; we leave them 0)
+	// ltr(GD_TSS0);
+	ltr(GD_TSS0 + sizeof(struct Segdesc) * cpunum());
+	// Load the IDT
+	lidt(&idt_pd);
+}
+```
+
+注意，我们需要运行命令```make qemu-nox CPUS=4```才会有四个核，打印信息才会是```SMP: CPU 0 found 4 CPU(s)```，否则默认是只有一个核
