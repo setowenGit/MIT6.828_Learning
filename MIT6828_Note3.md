@@ -422,3 +422,74 @@ trap_init_percpu(void)
 ```
 
 注意，我们需要运行命令```make qemu-nox CPUS=4```才会有四个核，打印信息才会是```SMP: CPU 0 found 4 CPU(s)```，否则默认是只有一个核
+
+##### Locking
+
+我们当前的代码在mp_main()中初始化AP之后自旋(spin), 在让AP更进一步之前，我们需要首先解决多个处理器同时运行内核代码时竞争条件
+
+实现这一点最简单的方法是使用一个大的内核锁。大内核锁是一个单一的全局锁，当环境进入内核模式时被持有，当环境返回用户模式时被释放。在这个模型中，用户模式下的环境可以在任何可用的处理器上并发运行。但是不能有超过一个环境在内核模式下运行，试图进入内核模式的任何其他环境都被迫等待
+
+kern/spinlock.h中声明了大内核锁kernel_lock.  它也提供了lock_kernel()和unlock_kernel()函数，简单地去获取或释放这个锁。需要在以下四个位置应用大内核锁：
+
+* i386_init()中，在BSP唤醒其他CPUs前获取大内核锁
+* mp_main()中，在初始化AP后获取锁，然后调用sched_yield()去在该AP上启动运行环境
+* trap()中，当从用户模式陷入内核模式时获取锁，可以检查tf_cs的低位确定是trap是发生在用户模式还是内核模式
+* env_run()中，在切换到用户模式前释放锁，不要太早或太晚释放，否则会经历races或者deadlocks\
+
+###### exercise 5
+
+通过在合适的位置上调用lock_kernel()和unlock_kernel, 像上面描述的那样应用大内核锁
+
+* lock_kernel()函数实际上是调用spin_lock()函数，里面实现上锁的代码是```xchg(&lk->locked, 1);```，xchg是汇编交换两个操作数内容的指令，该指令保证原子性
+* unlock_kernel()函数实际上是调用spin_unlock()函数，里面实际解锁的代码是```xchg(&lk->locked, 0);```
+* sched_yield()函数是线程（环境）调度函数
+
+**修改i386_init()**
+
+```c++
+// Acquire the big kernel lock before waking up APs
+// Your code here:
+lock_kernel();
+// Starting non-boot CPUs
+boot_aps();
+```
+
+**修改mp_main()**
+
+```c++
+// Your code here:
+lock_kernel();
+sched_yield();
+// Remove this after you finish Exercise 6
+for (;;);
+```
+
+**修改trap()**
+
+```c++
+if ((tf->tf_cs & 3) == 3) {
+  // Trapped from user mode.
+  // Acquire the big kernel lock before doing any
+  // serious kernel work.
+  // LAB 4: Your code here.
+  lock_kernel();
+  assert(curenv);
+```
+
+**修改env_run()**
+
+```c++
+lcr3(PADDR(curenv->env_pgdir));
+unlock_kernel();
+cprintf("start env_pop and running...\n");
+```
+
+**Question:** 似乎我们只需要使用大内核锁就能保证每次只有一个CPU运行内核代码，为什么还需要给每个CPU单独的内核堆栈？描述一下即便有大内核锁的保护但使用共享内核堆栈仍然出错的场景
+
+因为每个CPU进入内核时都会对一些数据进行压栈，这些数据可能是该CPU下某环境的数据，也可能是下一次再进入内核时需要的数据，若共用内核栈，每个CPU保存的上下文信息就会被破坏
+
+> 在Linux系统中，多个CPU可以同时进入内核态。Linux操作系统支持对称多处理（SMP），这意味着多个CPU核心可以同时执行内核代码，处理系统的各种任务和中断。每个CPU核心都可以独立地处理内核态的操作，不会因为其他CPU核心在内核态而被阻塞。
+> 
+> 在多CPU系统中，Linux确保对共享的内核数据进行正确的同步和互斥操作，以避免数据不一致的情况发生。这通常通过使用锁和其他同步机制来实现，确保只有一个CPU可以修改特定的内核数据，而其他CPU在修改之前必须等待或检查状态。因此，即使多个CPU可以同时进入内核态，Linux内核会确保在多处理器环境下维护数据的一致性和完整性。
+>
+> MIT 6.828课程中讨论的情况不适用于所有操作系统，特别是Linux操作系统在设计上允许多CPU同时进入内核态，该课程的操作系统这样设计的目的大概是这样实现简单，而且也避开了如何共享内核数据这个问题
