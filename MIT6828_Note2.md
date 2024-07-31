@@ -1361,7 +1361,7 @@ libmain(int argc, char **argv)
 在 kern/trap.c 的page_fault_handler函数中加入
 
 ```c++
-if(tf->tf_cs && 3 == 0) {
+if((tf->tf_cs & 3) == 0) {
     panic("page_fault in kernel mode, fault address %d\n", fault_va);
 }
 ```
