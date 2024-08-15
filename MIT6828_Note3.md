@@ -865,3 +865,110 @@ case SYS_env_set_pgfault_upcall:
 
 #### Invoking the User Page Fault Handler
 
+现在需要更改kern/trap.c中的页面错误处理代码，以处理用户模式下的页面错误，如下所示。我们将把故障发生时用户环境的状态称为trap-time状态
+
+内核态系统栈是运行内核相关程序的栈，在有中断被触发之后，CPU会将栈自动切换到内核栈上来。内核栈的设置是在kern/trap.c的trap_init_percpu()中完成的
+
+如果没有注册页面错误处理程序，JOS内核将像以前一样使用一个消息来破坏环境。否则，内核将在异常堆栈上设置一个trapframe，就像inc/trap.h中的struct UTrapframe：
+
+```c++
+struct PushRegs {
+	/* registers as pushed by pusha */
+	uint32_t reg_edi;
+	uint32_t reg_esi;
+	uint32_t reg_ebp;
+	uint32_t reg_oesp;		/* Useless */
+	uint32_t reg_ebx;
+	uint32_t reg_edx;
+	uint32_t reg_ecx;
+	uint32_t reg_eax;
+} __attribute__((packed));
+
+struct UTrapframe {
+	/* information about the fault */
+	uint32_t utf_fault_va;	/* va for T_PGFLT, 0 otherwise */
+	uint32_t utf_err;
+	/* trap-time return state */
+	struct PushRegs utf_regs;
+	uintptr_t utf_eip;
+	uint32_t utf_eflags;
+	/* the trap-time stack to return to */
+	uintptr_t utf_esp;
+} __attribute__((packed));
+```
+
+将它展开后就是
+
+```c++
+                    <-- UXSTACKTOP
+trap-time esp
+trap-time eflags
+trap-time eip
+trap-time eax       start of struct PushRegs
+trap-time ecx
+trap-time edx
+trap-time ebx
+trap-time esp
+trap-time ebp
+trap-time esi
+trap-time edi       end of struct PushRegs
+tf_err (error code)
+fault_va            <-- %esp when handler is run
+```
+
+* 相比于Trapframe，UTrapframe多了utf_fault_va，因为要记录触发错误的内存地址
+* 同时还少了es,ds,ss等。因为从用户态栈切换到异常栈，或者从异常栈再切换回去，实际上都是一个用户进程，所以不涉及到段的切换，不用记录
+* 在实际使用中，Trapframe是作为记录进程完整状态的结构体存在的，也作为函数参数进行传递；而UTrapframe只在处理用户定义错误的时候用
+
+然后，内核安排用户环境恢复执行，并使用此堆栈帧在异常堆栈上运行页面错误处理程序
+
+fault_va是导致页面错误的虚拟地址
+
+如果发生异常时，用户环境已经在用户异常堆栈上运行，则页面错误处理程序本身已经发生错误。在这种情况下，应该在当前tf-tf-esp下启动新的堆栈帧，而不是在UXSTACKTOP上，您应该首先推入一个空的32位word,然后是struct UTrapframe
+
+* 当正常执行过程中发生了页错误，那么栈的切换是: 用户运行栈—>内核栈—>异常栈
+* 如果在异常处理程序中发生了也错误，那么栈的切换是: 异常栈—>内核栈—>异常栈
+* 要测试tf->tf_esp是否已经位于用户异常堆栈上，请检查它是否位于UXSTACKTOP-PGSIZE和UXSTACKTOP-1之间（包括UXSTACKTOP-1）
+
+![](fig/2024-08-16-00-07-43.png)
+
+###### exercise 9
+
+实现kern/trap.c中page_fault_handler中的代码，将页面错误dispatch给用户模式处理程序。在写入异常堆栈时，请确保采取适当的预防措施（如果用户环境耗尽异常堆栈上的空间，会发生什么情况）
+
+```c++
+struct UTrapframe *utf;
+if (curenv->env_pgfault_upcall) {
+if (tf->tf_esp >= UXSTACKTOP-PGSIZE && tf->tf_esp < UXSTACKTOP) {
+	//如果异常是在用户异常栈发生，则推入4字节
+	utf = (struct UTrapframe *)(tf->tf_esp - sizeof(struct UTrapframe) - 4);
+
+}
+else {
+	//否则则是在用户运行栈发生的异常，直接把utf压入栈
+	utf = (struct UTrapframe *)(UXSTACKTOP - sizeof(struct UTrapframe));	
+}
+// 检查异常栈是否溢出,检查环境是否被允许进入内存（va,va+len）
+user_mem_assert(curenv, (const void *) utf, sizeof(struct UTrapframe), PTE_P|PTE_W);
+	
+utf->utf_fault_va = fault_va;
+utf->utf_err      = tf->tf_trapno;
+utf->utf_regs     = tf->tf_regs;
+utf->utf_eflags   = tf->tf_eflags;
+// 保存陷入时现场，用于返回
+utf->utf_eip      = tf->tf_eip;
+utf->utf_esp      = tf->tf_esp;
+// 再次转向执行
+curenv->env_tf.tf_eip        = (uint32_t) curenv->env_pgfault_upcall;
+// 异常栈
+curenv->env_tf.tf_esp        = (uint32_t) utf;
+env_run(curenv);
+}
+else {
+// Destroy the environment that caused the fault.
+cprintf("[%08x] user fault va %08x ip %08x\n",
+	curenv->env_id, fault_va, tf->tf_eip);
+print_trapframe(tf);
+env_destroy(curenv);
+}
+```
